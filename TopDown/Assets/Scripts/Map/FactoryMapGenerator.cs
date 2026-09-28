@@ -130,6 +130,20 @@ public class FactoryMapGenerator : NetworkBehaviour
         public readonly List<Collider2D> Colliders = new List<Collider2D>();
     }
 
+    /// <summary>
+    /// Binary Space Partition node for deterministic room placement.
+    /// The BSP tree recursively subdivides the factory floor into non-overlapping rectangular
+    /// zones, guaranteeing that every room archetype (Auditorium, Workshop, Standard, Closet)
+    /// receives appropriately sized space without random overlap-retry failures.
+    /// </summary>
+    private class BspNode
+    {
+        public RectInt Bounds;
+        public BspNode Left;
+        public BspNode Right;
+        public bool IsLeaf => Left == null && Right == null;
+    }
+
     // ────────────────────────────── Singleton ──────────────────────────────
 
     /// <summary>Active singleton instance in the scene.</summary>
@@ -922,8 +936,8 @@ public class FactoryMapGenerator : NetworkBehaviour
             CarveNonGroundFloorArterialHallways(rng, ringOuter);
         }
 
-        // 5. Carve 15 rooms across the 4 size archetypes (Auditoriums -> LargeWorkshops -> StandardRooms -> Closets)
-        CarveInteriorRoomsByArchetype(rng);
+        // 5. Carve rooms via BSP (Binary Space Partitioning) across 4 size archetypes
+        CarveInteriorRoomsViaBsp(rng);
 
         // 6. Connect rooms with secondary hallways and doorways according to each room's TargetDoorways (1–4)
         ConnectRoomsWithSecondaryHallwaysAndDoors(rng, ringOuter);
@@ -1390,95 +1404,329 @@ public class FactoryMapGenerator : NetworkBehaviour
         }
     }
 
-    private void CarveInteriorRoomsByArchetype(System.Random rng)
+    // ──────────────── BSP (Binary Space Partitioning) Constants ────────────
+
+    /// <summary>
+    /// Minimum dimension (width or height) in tiles for a BSP leaf to be considered
+    /// viable for room placement (room interior + 1-tile wall padding each side).
+    /// </summary>
+    private const int BspMinLeafDim = 9;
+
+    /// <summary>
+    /// Maximum BSP tree recursion depth. Controls the granularity of spatial partitioning.
+    /// Higher values produce more, smaller rooms; lower values produce fewer, larger rooms.
+    /// </summary>
+    private const int BspMaxDepth = 5;
+
+    // ──────────────── BSP Room Placement ─────────────────────────────────
+
+    /// <summary>
+    /// Replaces random-coordinate room placement with BSP (Binary Space Partitioning).
+    /// Subdivides the factory floor into 8 zones around the central ring hallway,
+    /// recursively partitions each zone into non-overlapping rectangular leaves, then
+    /// places rooms sized to each leaf's dimensions — guaranteeing that Auditoriums and
+    /// Workshops always receive appropriately sized space without retry failures.
+    /// </summary>
+    private void CarveInteriorRoomsViaBsp(System.Random rng)
     {
         int targetRooms = _config != null ? _config.TargetRoomCount : 15;
+        RectInt ring = _currentFloor.RingOuterBounds;
 
-        var desiredArchetypes = new List<RoomArchetype>();
-        int remaining = Mathf.Max(4, targetRooms - 1);
+        // ── Define 8 non-overlapping zones tiling the building interior around the ring ──
+        //
+        //   +------+--------+------+
+        //   |  NW  |   N    |  NE  |
+        //   +------+--------+------+
+        //   |  W   | [RING] |  E   |
+        //   +------+--------+------+
+        //   |  SW  |   S    |  SE  |
+        //   +------+--------+------+
+        //
+        var zones = new List<RectInt>(8);
+        int bMinX = 2, bMinY = 2;
+        int bMaxX = _width - 2, bMaxY = _height - 2;
 
-        int auditoriumCount = Mathf.Clamp(remaining / 7, 1, 2);
-        int workshopCount = Mathf.Clamp(remaining / 4, 2, 4);
-        int closetCount = Mathf.Clamp(remaining / 4, 2, 4);
-        int standardCount = Mathf.Max(1, remaining - auditoriumCount - workshopCount - closetCount);
+        // 4 corner quadrants
+        AddBspZoneIfViable(zones, bMinX,     ring.yMax, ring.xMin - bMinX, bMaxY - ring.yMax); // NW
+        AddBspZoneIfViable(zones, ring.xMax, ring.yMax, bMaxX - ring.xMax, bMaxY - ring.yMax); // NE
+        AddBspZoneIfViable(zones, bMinX,     bMinY,     ring.xMin - bMinX, ring.yMin - bMinY); // SW
+        AddBspZoneIfViable(zones, ring.xMax, bMinY,     bMaxX - ring.xMax, ring.yMin - bMinY); // SE
 
-        for (int i = 0; i < auditoriumCount; i++) desiredArchetypes.Add(RoomArchetype.Auditorium);
-        for (int i = 0; i < workshopCount; i++) desiredArchetypes.Add(RoomArchetype.LargeWorkshop);
-        for (int i = 0; i < standardCount; i++) desiredArchetypes.Add(RoomArchetype.StandardRoom);
-        for (int i = 0; i < closetCount; i++) desiredArchetypes.Add(RoomArchetype.Closet);
+        // 4 strip zones (between ring outer edge and building perimeter)
+        AddBspZoneIfViable(zones, ring.xMin, ring.yMax, ring.width,        bMaxY - ring.yMax); // N
+        AddBspZoneIfViable(zones, ring.xMin, bMinY,     ring.width,        ring.yMin - bMinY); // S
+        AddBspZoneIfViable(zones, ring.xMax, ring.yMin, bMaxX - ring.xMax, ring.height);       // E
+        AddBspZoneIfViable(zones, bMinX,     ring.yMin, ring.xMin - bMinX, ring.height);       // W
 
-        for (int idx = 0; idx < desiredArchetypes.Count && _rooms.Count < targetRooms; idx++)
+        // ── Build BSP trees for each zone and collect all leaf partitions ──
+        var allLeaves = new List<BspNode>(64);
+        for (int i = 0; i < zones.Count; i++)
         {
-            RoomArchetype archetype = desiredArchetypes[idx];
-            if (!TryPlaceRoomOfArchetype(archetype, rng))
+            BspNode tree = BuildBspTree(zones[i], rng, 0, BspMaxDepth);
+            CollectBspLeaves(tree, allLeaves);
+        }
+
+        // Sort leaves by area descending so the largest partitions (Auditoriums, Workshops)
+        // get first priority for room placement
+        allLeaves.Sort((a, b) =>
+        {
+            int areaA = a.Bounds.width * a.Bounds.height;
+            int areaB = b.Bounds.width * b.Bounds.height;
+            return areaB.CompareTo(areaA);
+        });
+
+        // ── Place rooms in BSP leaves until we reach the target count ──
+        int targetFromBsp = Mathf.Max(0, targetRooms - _rooms.Count);
+        int placed = 0;
+        for (int i = 0; i < allLeaves.Count && placed < targetFromBsp; i++)
+        {
+            if (TryPlaceRoomInBspLeaf(allLeaves[i], rng))
             {
-                RoomArchetype fallback = archetype switch
-                {
-                    RoomArchetype.Auditorium => RoomArchetype.LargeWorkshop,
-                    RoomArchetype.LargeWorkshop => RoomArchetype.StandardRoom,
-                    _ => RoomArchetype.Closet
-                };
-                if (!TryPlaceRoomOfArchetype(fallback, rng))
-                {
-                    TryPlaceRoomOfArchetype(RoomArchetype.Closet, rng);
-                }
+                placed++;
             }
         }
-    }
 
-    private bool TryPlaceRoomOfArchetype(RoomArchetype archetype, System.Random rng)
-    {
-        int maxAttempts = archetype == RoomArchetype.Auditorium ? 450 : 350;
-        int doorSpan = archetype == RoomArchetype.Closet ? 3 : GetDoorwaySpan();
-
-        for (int a = 0; a < maxAttempts; a++)
+        // ── Fallback: fill remaining slots with small random rooms if BSP fell short ──
+        int fallbackAttempts = 0;
+        int maxFallbackAttempts = (targetFromBsp - placed) * 80;
+        while (_rooms.Count < targetRooms && fallbackAttempts < maxFallbackAttempts)
         {
-            GetDimensionsForArchetype(archetype, rng, a > maxAttempts / 2, out int rw, out int rh);
+            fallbackAttempts++;
+            int rw = rng.Next(5, 12);
+            int rh = rng.Next(5, 12);
             int rx = rng.Next(2, _width - rw - 2);
             int ry = rng.Next(2, _height - rh - 2);
 
-            var candidate = new RectInt(rx, ry, rw, rh);
             if (!IsRegionPureWall(rx - 1, ry - 1, rw + 2, rh + 2)) continue;
 
+            var candidate = new RectInt(rx, ry, rw, rh);
+            int doorSpan = 3;
             Vector2Int doorCell;
             bool horizontalDoor;
             bool connected =
                 TryFindHallwayDoorwaySpot(candidate, doorSpan, rng, out doorCell, out horizontalDoor) ||
                 TryCarveBranchHallwayToRoom(candidate, doorSpan, out doorCell, out horizontalDoor) ||
-                (a > 120 && TryFindAdjacentRoomDoorwaySpot(candidate, doorSpan, rng, out doorCell, out horizontalDoor));
+                TryFindAdjacentRoomDoorwaySpot(candidate, doorSpan, rng, out doorCell, out horizontalDoor);
 
             if (!connected) continue;
 
             for (int x = rx; x < rx + rw; x++)
-            {
                 for (int y = ry; y < ry + rh; y++)
-                {
                     _grid[x, y] = CellType.RoomFloor;
-                }
-            }
 
             if (horizontalDoor)
-            {
                 CarveHorizontalDoorway(doorCell.x, doorCell.y, doorSpan);
-            }
             else
-            {
                 CarveVerticalDoorway(doorCell.x, doorCell.y, doorSpan);
-            }
 
-            GetArchetypeDoorAndWindowTargets(archetype, rng, out int targetDoors, out int targetWindows);
+            RoomArchetype fallbackArch = (rw >= 11 && rh >= 11)
+                ? RoomArchetype.StandardRoom
+                : RoomArchetype.Closet;
+            GetArchetypeDoorAndWindowTargets(fallbackArch, rng, out int td, out int tw);
 
             _rooms.Add(new RoomData
             {
                 FloorLevel = _currentFloor.FloorLevel,
                 Bounds = candidate,
-                Archetype = archetype,
+                Archetype = fallbackArch,
                 IsObjectiveRoom = false,
-                TargetDoorways = targetDoors,
+                TargetDoorways = td,
                 ActualDoorways = 1,
-                TargetWindows = targetWindows
+                TargetWindows = tw
             });
-            return true;
+        }
+    }
+
+    /// <summary>Adds a zone to the list only if both dimensions meet the minimum BSP leaf size.</summary>
+    private static void AddBspZoneIfViable(List<RectInt> zones, int x, int y, int w, int h)
+    {
+        if (w >= BspMinLeafDim && h >= BspMinLeafDim)
+        {
+            zones.Add(new RectInt(x, y, w, h));
+        }
+    }
+
+    /// <summary>
+    /// Recursively subdivides a rectangular region into a binary tree of sub-partitions.
+    /// Split direction favors the longer axis with 80% probability for natural room proportions.
+    /// Split position is biased toward the center (±30%) for balanced partition sizes.
+    /// </summary>
+    private BspNode BuildBspTree(RectInt bounds, System.Random rng, int depth, int maxDepth)
+    {
+        var node = new BspNode { Bounds = bounds };
+
+        if (depth >= maxDepth) return node;
+
+        // Both children must be at least BspMinLeafDim in the split dimension
+        int minSplitDim = BspMinLeafDim * 2 + 1;
+        bool canSplitH = bounds.height >= minSplitDim;
+        bool canSplitV = bounds.width >= minSplitDim;
+
+        if (!canSplitH && !canSplitV) return node;
+
+        // Choose split axis: strongly prefer splitting the longer dimension
+        bool splitHorizontal;
+        if (canSplitH && !canSplitV)       splitHorizontal = true;
+        else if (!canSplitH && canSplitV)  splitHorizontal = false;
+        else splitHorizontal = bounds.height > bounds.width
+            ? (rng.Next(100) < 80)
+            : (rng.Next(100) < 20);
+
+        if (splitHorizontal)
+        {
+            int splitMin = bounds.yMin + BspMinLeafDim;
+            int splitMax = bounds.yMax - BspMinLeafDim;
+            if (splitMin > splitMax) return node;
+
+            int center = (splitMin + splitMax) / 2;
+            int range = Mathf.Max(1, (splitMax - splitMin) * 30 / 100);
+            int splitY = Mathf.Clamp(center + rng.Next(-range, range + 1), splitMin, splitMax);
+
+            node.Left = BuildBspTree(
+                new RectInt(bounds.xMin, bounds.yMin, bounds.width, splitY - bounds.yMin),
+                rng, depth + 1, maxDepth);
+            node.Right = BuildBspTree(
+                new RectInt(bounds.xMin, splitY, bounds.width, bounds.yMax - splitY),
+                rng, depth + 1, maxDepth);
+        }
+        else
+        {
+            int splitMin = bounds.xMin + BspMinLeafDim;
+            int splitMax = bounds.xMax - BspMinLeafDim;
+            if (splitMin > splitMax) return node;
+
+            int center = (splitMin + splitMax) / 2;
+            int range = Mathf.Max(1, (splitMax - splitMin) * 30 / 100);
+            int splitX = Mathf.Clamp(center + rng.Next(-range, range + 1), splitMin, splitMax);
+
+            node.Left = BuildBspTree(
+                new RectInt(bounds.xMin, bounds.yMin, splitX - bounds.xMin, bounds.height),
+                rng, depth + 1, maxDepth);
+            node.Right = BuildBspTree(
+                new RectInt(splitX, bounds.yMin, bounds.xMax - splitX, bounds.height),
+                rng, depth + 1, maxDepth);
+        }
+
+        return node;
+    }
+
+    /// <summary>Recursively collects all leaf nodes from a BSP tree.</summary>
+    private static void CollectBspLeaves(BspNode node, List<BspNode> leaves)
+    {
+        if (node == null) return;
+        if (node.IsLeaf) { leaves.Add(node); return; }
+        CollectBspLeaves(node.Left, leaves);
+        CollectBspLeaves(node.Right, leaves);
+    }
+
+    /// <summary>
+    /// Classifies the best-fitting room archetype for a BSP leaf based on its available
+    /// interior dimensions (after subtracting 1-tile wall padding on each side).
+    /// </summary>
+    private static RoomArchetype ClassifyBspLeafArchetype(int interiorW, int interiorH)
+    {
+        int minDim = Mathf.Min(interiorW, interiorH);
+        int maxDim = Mathf.Max(interiorW, interiorH);
+
+        if (minDim >= 20 && maxDim >= 26) return RoomArchetype.Auditorium;
+        if (minDim >= 18)                 return RoomArchetype.LargeWorkshop;
+        if (minDim >= 11)                 return RoomArchetype.StandardRoom;
+        if (minDim >= 5)                  return RoomArchetype.Closet;
+
+        return RoomArchetype.Closet;
+    }
+
+    /// <summary>
+    /// Attempts to place a room inside a BSP leaf partition. Determines the room archetype from
+    /// the leaf dimensions, validates pure wall space, carves the room floor, and connects it
+    /// to the hallway network via doorways or branch corridors.
+    /// Falls back through smaller archetypes if the primary archetype cannot fit.
+    /// </summary>
+    private bool TryPlaceRoomInBspLeaf(BspNode leaf, System.Random rng)
+    {
+        RectInt lb = leaf.Bounds;
+
+        // Available interior after reserving 1-tile wall padding on each side
+        int availW = lb.width - 2;
+        int availH = lb.height - 2;
+        if (availW < 5 || availH < 5) return false;
+
+        // Determine archetype tiers to try (best fit → fallbacks)
+        RoomArchetype primary = ClassifyBspLeafArchetype(availW, availH);
+        RoomArchetype[] tiers = primary switch
+        {
+            RoomArchetype.Auditorium =>
+                new[] { RoomArchetype.Auditorium, RoomArchetype.LargeWorkshop, RoomArchetype.StandardRoom },
+            RoomArchetype.LargeWorkshop =>
+                new[] { RoomArchetype.LargeWorkshop, RoomArchetype.StandardRoom, RoomArchetype.Closet },
+            RoomArchetype.StandardRoom =>
+                new[] { RoomArchetype.StandardRoom, RoomArchetype.Closet },
+            _ =>
+                new[] { RoomArchetype.Closet }
+        };
+
+        for (int tier = 0; tier < tiers.Length; tier++)
+        {
+            RoomArchetype tryArch = tiers[tier];
+            int attemptsPerTier = tryArch == RoomArchetype.Closet ? 6 : 10;
+
+            for (int attempt = 0; attempt < attemptsPerTier; attempt++)
+            {
+                // Generate room dimensions within archetype range, clamped to leaf interior
+                bool useSmallerFallback = attempt > attemptsPerTier / 2;
+                GetDimensionsForArchetype(tryArch, rng, useSmallerFallback, out int rw, out int rh);
+                rw = Mathf.Min(rw, availW);
+                rh = Mathf.Min(rh, availH);
+                if (rw < 5 || rh < 5) continue;
+
+                // Position the room within the leaf with randomized offset from the padding edge
+                int maxOffX = Mathf.Max(0, availW - rw);
+                int maxOffY = Mathf.Max(0, availH - rh);
+                int rx = lb.xMin + 1 + (maxOffX > 0 ? rng.Next(0, maxOffX + 1) : 0);
+                int ry = lb.yMin + 1 + (maxOffY > 0 ? rng.Next(0, maxOffY + 1) : 0);
+
+                // Validate that room footprint (plus 1-tile wall border) is pure uncarved wall
+                if (!IsRegionPureWall(rx - 1, ry - 1, rw + 2, rh + 2)) continue;
+
+                var candidate = new RectInt(rx, ry, rw, rh);
+
+                // Connect room to hallway network via doorway or branch corridor
+                int doorSpan = tryArch == RoomArchetype.Closet ? 3 : GetDoorwaySpan();
+                Vector2Int doorCell;
+                bool horizontalDoor;
+                bool connected =
+                    TryFindHallwayDoorwaySpot(candidate, doorSpan, rng, out doorCell, out horizontalDoor) ||
+                    TryCarveBranchHallwayToRoom(candidate, doorSpan, out doorCell, out horizontalDoor) ||
+                    TryFindAdjacentRoomDoorwaySpot(candidate, doorSpan, rng, out doorCell, out horizontalDoor);
+
+                if (!connected) continue;
+
+                // Carve the room floor tiles
+                for (int x = rx; x < rx + rw; x++)
+                    for (int y = ry; y < ry + rh; y++)
+                        _grid[x, y] = CellType.RoomFloor;
+
+                // Carve the connecting doorway
+                if (horizontalDoor)
+                    CarveHorizontalDoorway(doorCell.x, doorCell.y, doorSpan);
+                else
+                    CarveVerticalDoorway(doorCell.x, doorCell.y, doorSpan);
+
+                // Register room with archetype-appropriate door and window targets
+                GetArchetypeDoorAndWindowTargets(tryArch, rng, out int targetDoors, out int targetWindows);
+                _rooms.Add(new RoomData
+                {
+                    FloorLevel = _currentFloor.FloorLevel,
+                    Bounds = candidate,
+                    Archetype = tryArch,
+                    IsObjectiveRoom = false,
+                    TargetDoorways = targetDoors,
+                    ActualDoorways = 1,
+                    TargetWindows = targetWindows
+                });
+
+                return true;
+            }
         }
 
         return false;

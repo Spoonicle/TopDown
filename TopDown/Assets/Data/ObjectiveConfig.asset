@@ -1,0 +1,22 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &11400000
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 12829c4de3a91cb4a84f16bfc4eb7aad, type: 3}
+  m_Name: ObjectiveConfig
+  m_EditorClassIdentifier: Assembly-CSharp::ObjectiveConfig
+  _interactionRadius: 2.2
+  _progressPerKeystroke: 0.016
+  _maxKeystrokesPerFrame: 4
+  _progressDecayPerSecond: 0
+  _extractionRadius: 2.5
+  _terminalIdleColor: {r: 0.95, g: 0.65, b: 0.15, a: 1}
+  _terminalHackingColor: {r: 0.2, g: 0.95, b: 0.55, a: 1}
+  _terminalCompletedColor: {r: 0.25, g: 0.3, b: 0.35, a: 1}

@@ -68,3 +68,13 @@ Welcome to this project. All AI agents, coding assistants, and automated tools w
 - Use the Unity MCP to create, move, or modify GameObjects in the scene.
 - When adding new assets, place them in appropriate subfolders under `Assets/` (e.g., `Assets/Sprites/`, `Assets/Prefabs/`, `Assets/Materials/`, `Assets/Scripts/`).
 - Organize assets logically by type or feature.
+
+### 12. Multiplayer-First Architecture (Mandatory)
+- Every gameplay feature, weapon, ability, grenade, objective, and UI system **must be designed and implemented for multiplayer from the start** using **Unity Netcode for GameObjects (`Unity.Netcode`)**.
+- Use `NetworkBehaviour` and `NetworkObject` for networked entities, and register any dynamically spawned prefabs with `NetworkManager`.
+- Strictly separate **Client/Owner Authority** from **Server Authority**:
+  - **Owner Authority (`IsOwner` / `HasInputAuthority`)**: Player input, local camera tracking (`TopDownCamera`), local screen shake, flashbang screen whiteout, and local HUD/vision cone must only affect the owning client.
+  - **Server Authority (`IsServer` / `HasServerAuthority`)**: Damage calculation, health (`NetworkVariable`), grenade physics/detonation, foam containment, objective state, and AI dummy logic must be authoritative on the Server/Host.
+  - **Replication (`NetworkVariable` & `Rpc`)**: Sync persistent state via `NetworkVariable<T>` and broadcast transient events (shots, tracers, muzzle flashes, explosions, radio callouts) via `[Rpc]`.
+- **Dynamic N-Team Support**: Never hardcode a fixed two-team enum. Always use `TeamData` ScriptableObjects and `TeamMember.CanDamage(attacker, target)` so any number of teams works out of the box (*cannot shoot/damage own team; can shoot/damage all other teams*).
+- **Zero-Friction Solo Playtesting**: Ensure `NetworkBootstrap` auto-starts as Host in the Editor and keep safe `!IsSpawned` fallbacks so pressing Play immediately works for solo testing against dummies.

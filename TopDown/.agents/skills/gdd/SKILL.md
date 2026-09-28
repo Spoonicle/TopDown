@@ -96,25 +96,28 @@ A single match (approx. 5–10 minutes):
   - Spread / accuracy
   - Magazine size / reload time
   - Muzzle flash intensity (affects visibility for both shooter and targets)
+  - Equipped indicator visual (e.g., long black line for rifle, shorter black line for pistol — configurable per `WeaponData` asset)
+- **Fire modes**: Both the default Rifle and Service Pistol are semi-automatic (one shot per click), configurable per `WeaponData` asset.
 - **Walls are impenetrable**: Bullets do not pass through walls. No wallbanging.
 - **Gunfire sound propagation**: The sound of gunfire carries through the entire building. All players can hear shots fired anywhere in the factory, though volume attenuates with distance and floors.
 
-### Enemies
-- No AI enemies. This is a PvP-only game (3v3, humans vs humans).
-- The opposing 3-player squad is the enemy.
+### Teams & Opponents
+- PvP-only game (default 3v3 squads, with solo-test AI dummies for whitebox development).
+- **Dynamic N-Team Architecture**: Teams are defined via `TeamData` ScriptableObjects (not hardcoded binary enums), allowing any number of teams to be added in the future without code changes.
+- **Friendly-Fire Rule**: Characters **cannot** shoot or damage members of their own team (`TeamMember.CanDamage` returns `false` for teammates, and hitscan raycasts pass through same-team colliders), and **can** shoot and damage all other teams.
 
 ### Boss Encounters
 - N/A — PvP only. No boss encounters.
 
 ### Damage System
-- **Hitscan or fast projectile** (TBD — start with hitscan for whitebox)
+- **Hitscan** (server-authoritative raycast with client visual replication)
 - **Flat damage per bullet** modified by:
   - Distance falloff (tunable curve)
   - Headshot multiplier (future consideration — may be too complex for top-down)
 - **Grenade damage**: Frag grenades deal high damage in a radius with falloff
 - **Flash grenades**: No damage, but apply a "flashed" debuff (screen whiteout, muffled audio) for a duration
 - **Grenade foam**: No damage. Utility only — contains grenade explosions
-- **Wounded effects**: As health decreases, player movement speed decreases proportionally. Blood trail intensity increases.
+- **Wounded effects**: As health decreases, player movement speed decreases proportionally (`Health.WoundedSpeedMultiplier` evaluated from `PlayerConfig.WoundedSpeedCurve`). Blood trail intensity increases.
 
 ---
 
@@ -124,27 +127,24 @@ A single match (approx. 5–10 minutes):
 Modern-day, abandoned industrial factory. Cold, utilitarian architecture — concrete walls, metal catwalks, rusted pipes, broken windows. Set during a moonless night. The factory has been abandoned but still has emergency lighting in some hallways. The atmosphere is oppressive and claustrophobic.
 
 ### Level Structure
-- **Procedurally generated interior**: The factory interior is assembled from pre-designed room/hallway tiles that snap together. This ensures replayability while maintaining quality level design. (Procedural generation system to be built iteratively.)
-- **1 to 3 stories**: Each match randomly determines the floor count (1, 2, or 3 floors). Staircases connect floors.
-- **Multi-floor rendering**: Fundamentally 2D layer swap — each floor is its own flat layout. When on a given floor, the current floor is fully visible and other floors are hidden. Subtle hints of verticality (e.g., darkened floor below visible through gaps/grates) to sell the multi-story feel.
-- **Exterior courtyards**: Two fixed courtyards on opposite sides of the factory serve as spawn/extraction zones. These are NOT procedural.
-- **Objective room**: One room in the factory is designated as the objective room. Its location is randomized each match but is always interior (never in a courtyard).
-- **Room types**: Offices, storage rooms, boiler rooms, server rooms, loading docks, break rooms, bathrooms, maintenance corridors, stairwells.
+- **Procedurally generated cement factory**: Synced across multiplayer via a single server-authoritative `mapSeed` (`NetworkVariable<int>`). Each match generates a new interior layout of concrete hallways, dark rooms, interior cover (pillars/crates), and **1 Objective Room** containing the `ComputerTerminal`.
+- **4 Perimeter Entrances**: The factory exterior features 4 entrances (one on each of the North, East, South, and West walls), randomly shifted along each wall per seed while maintaining minimum spacing so teams never start fighting immediately at spawn.
+- **Random Entrance Spawns & Extraction**: At round start, each team's spawn and `ExtractionZone` are placed outside a randomly selected entrance (never the same entrance), so teams do not immediately know which entrance the opposing squad used.
+- **Physics-Pushed Swinging Doors**: Doorways contain physical doors (`SwingDoor`) that swing open when players push against them with either their player body or their equipped weapon barrel (`WeaponVisual`).
+- **Dark Rooms & Flickering Hallway Lights**: Interior rooms are dark; visibility comes from hallway emergency lights (`HallwayLight` — some steady on, some flickering, some off), objective terminal glow, and dynamic 2D muzzle flashes.
+- **1 to 3 stories** (future expansion): Each match can determine floor count (1, 2, or 3 floors) connected by staircases.
+- **Multi-floor rendering**: Fundamentally 2D layer swap — each floor is its own flat layout with subtle visual hints of verticality.
 
 ### Environmental Hazards
 - **Darkness itself**: Limited visibility is the primary hazard. Players can only see clearly in lit areas or during muzzle flashes.
 - **Destructible lights** (future): Shooting out hallway lights to create dark zones
-- **Locked doors** (future): Doors that require breaching, creating noise
+- **Physics doors**: Doors physically swing and can reveal movement when pushed open by a player or gun barrel
 - **Glass windows** (future): Breakable, allowing sight lines and sound propagation
 
 ### Camera
 - **Fixed top-down camera** (orthographic or near-orthographic)
 - Camera is centered on the player
-- **Field of view cone**: Players have a visible cone of vision in the direction they face. Areas outside the cone are darker/fogged. Areas behind walls are not visible (fog of war).
-- **Fog of war implementation (phased)**:
-  - **Whitebox/MVP**: Simple cone of brighter visibility in the aim direction + darkened periphery. Walls don't fully occlude — functional but lightweight.
-  - **Target**: Full raycasted fog of war — areas behind walls are completely hidden, only what's within the vision cone and unobstructed by geometry is revealed.
-- **Shared team vision** (future consideration): Teammates share their vision cones
+- Visibility is driven by the environment's 2D lighting (dark rooms, steady/flickering hallway lights, objective monitor glow, and dynamic weapon muzzle flashes) without a synthetic Fog of War mesh overlay.
 - Slight camera smoothing/lerp on player movement
 
 ---
@@ -323,20 +323,26 @@ Modern-day, abandoned industrial factory. Cold, utilitarian architecture — con
 - Network tick rate: 20–30 ticks/sec minimum for responsive multiplayer (future, when networking is implemented)
 - Modular script architecture: all gameplay systems built as independent, configurable components for easy iteration and expansion
 
-### Networking (Future)
-- Multiplayer will be authoritative server or relay-based (Netcode for GameObjects, Photon, or Mirror — TBD)
-- Initially: Build all systems as local/single-client first, then layer networking on top
-- All gameplay values (damage, speed, health, grenade properties) exposed as ScriptableObject configs for easy balancing
+### Networking (Active — Multiplayer-First)
+- **Framework**: **Unity Netcode for GameObjects (`com.unity.netcode.gameobjects`)** with `UnityTransport` (Client-Host architecture, relay-ready).
+- **Mandatory Multiplayer-First Design**: Every new feature, weapon, grenade, foam patch, objective, and audio/visual callout must be built as a `NetworkBehaviour` (or synced via RPCs/`NetworkVariable`s) from day one.
+- **Authority Model**:
+  - **Owner Authority (`IsOwner` / `HasInputAuthority`)**: Local player input, `TopDownCamera` target tracking, local screen shake, flashbang whiteout, and local HUD/vision cone.
+  - **Server Authority (`IsServer` / `HasServerAuthority`)**: Health & damage (`NetworkVariable<float>`), friendly-fire validation (`TeamMember.CanDamage`), grenade trajectories & detonation, foam neutralization, objective state, and AI dummy patrol/combat.
+- **Solo Playtesting Workflow**: `NetworkBootstrap` automatically starts as Host when entering Play Mode in the Editor (`_autoStartHost = true`) and spawns `Player.prefab` on opposing teams for any additional connecting clients.
+- All gameplay values (damage, speed, health, grenade properties, team definitions) exposed as ScriptableObject configs for easy balancing.
 
 ---
 
 ## 12. Scope & Priorities
 
 ### MVP (Minimum Viable Product) — "White Box"
-- [ ] Top-down player controller (WASD + mouse aim) with New Input System
-- [ ] Basic shooting mechanic (hitscan, muzzle flash, bullet impact on walls)
-- [ ] Health system with wounded slowdown and blood trails
-- [ ] Death (no respawn within round)
+- [x] Top-down player controller (WASD + mouse aim) with New Input System & `TopDownCamera` smooth follow
+- [x] Basic shooting mechanic (hitscan, muzzle flash, tracer lines, weapon indicator lines, Rifle + Pistol swapping)
+- [x] Health system with wounded slowdown and blood trails (`Health` + `PlayerConfig.WoundedSpeedCurve`)
+- [x] Death (no respawn within round, body darkening + collider/weapon disable)
+- [x] Dynamic N-Team system (`TeamData` + `TeamMember` — cannot shoot own team, can shoot all other teams)
+- [x] Multiplayer foundation with Unity Netcode for GameObjects (`NetworkBootstrap`, `NetworkBehaviour` sync)
 - [ ] Frag grenade (throw at cursor, explosion with damage radius)
 - [ ] Flash grenade (throw at cursor, whiteout effect on players in LOS)
 - [ ] Grenade foam (throw at cursor, neutralizes grenades in area)
@@ -346,13 +352,13 @@ Modern-day, abandoned industrial factory. Cold, utilitarian architecture — con
 - [ ] Basic 2D lighting (hallway lights + muzzle flash dynamic lights)
 - [ ] Radio callout system (Left Alt, Papers Please voice, position text)
 - [ ] Gunfire sound propagation (audible across map, distance attenuation)
-- [ ] AI dummy targets for solo testing (stationary + simple patrol) — test shooting, grenades, and game feel without needing a second player
-- [ ] Basic whitebox art (rectangles, simple shapes, flat colors)
-- [ ] Screen shake and basic hit feedback
+- [x] AI dummy targets for solo testing (stationary + simple patrol) — test shooting, grenades, and game feel without needing a second player
+- [x] Basic whitebox art (rectangles, simple shapes, flat colors)
+- [x] Screen shake and basic hit feedback
 
 ### Nice-to-Have
 - Procedural map generation (tile-based factory interiors, 1–3 floors)
-- Online multiplayer (Netcode/Photon/Mirror integration)
+- Online relay / lobby matchmaking integration (Steam Relay / Unity Relay)
 - Computer objective (data extraction with progress bar)
 - Additional objective types
 - Loadout selection (weapon choices)

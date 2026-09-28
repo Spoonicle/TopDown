@@ -1,0 +1,59 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &11400000
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 8a195ed88018ca4408435e9ddbdef6dd, type: 3}
+  m_Name: Pistol
+  m_EditorClassIdentifier: Assembly-CSharp::WeaponData
+  _displayName: Service Pistol
+  _slot: 1
+  _fireMode: 0
+  _fireRate: 5
+  _damage: 30
+  _range: 30
+  _spreadAngle: 2
+  _damageFalloff:
+    serializedVersion: 2
+    m_Curve:
+    - serializedVersion: 3
+      time: 0
+      value: 1
+      inSlope: 0
+      outSlope: -0.6
+      tangentMode: 0
+      weightedMode: 0
+      inWeight: 0
+      outWeight: 0
+    - serializedVersion: 3
+      time: 1
+      value: 0.4
+      inSlope: -0.6
+      outSlope: 0
+      tangentMode: 0
+      weightedMode: 0
+      inWeight: 0
+      outWeight: 0
+    m_PreInfinity: 2
+    m_PostInfinity: 2
+    m_RotationOrder: 4
+  _magazineSize: 12
+  _maxReserveAmmo: 36
+  _reloadTime: 1.5
+  _visualSprite: {fileID: 0}
+  _visualLength: 0.45
+  _visualWidth: 0.09
+  _visualOffset: {x: 0.45, y: 0}
+  _visualColor: {r: 0, g: 0, b: 0, a: 1}
+  _muzzleFlashIntensity: 2
+  _muzzleFlashRadius: 3.5
+  _muzzleFlashDuration: 0.05
+  _muzzleFlashColor: {r: 1, g: 0.96, b: 0.8, a: 1}
+  _recoilShake: 0.12
+  _barrelOffset: 0.7

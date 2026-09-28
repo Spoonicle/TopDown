@@ -30,6 +30,8 @@ public class HallwayLight : MonoBehaviour
     private Color _lightColor = new Color(0.88f, 0.74f, 0.42f, 1f);
     private float _noiseSeed;
     private float _flickerSpeed = 9f;
+    private float _floorVisibilityAlpha = 1f;
+    private float _lastFlickerMultiplier = 1f;
 
     private Light2D _light2D;
     private SpriteRenderer _bulbRenderer;
@@ -54,9 +56,20 @@ public class HallwayLight : MonoBehaviour
         _lightColor = lightColor;
         _noiseSeed = noiseSeed;
         _flickerSpeed = 7f + (Mathf.Abs(noiseSeed) % 6f);
+        _floorVisibilityAlpha = 1f;
+        _lastFlickerMultiplier = 1f;
 
         SetupComponents();
         ApplyState(1f);
+    }
+
+    /// <summary>
+    /// Sets the floor cross-fade visibility weight (0–1) for this light when transitioning along stairs.
+    /// </summary>
+    public void SetFloorVisibilityAlpha(float alpha)
+    {
+        _floorVisibilityAlpha = Mathf.Clamp01(alpha);
+        ApplyState(_lastFlickerMultiplier);
     }
 
     private void SetupComponents()
@@ -118,19 +131,20 @@ public class HallwayLight : MonoBehaviour
 
     private void ApplyState(float intensityMultiplier)
     {
+        _lastFlickerMultiplier = intensityMultiplier;
         if (_light2D == null || _bulbRenderer == null) return;
 
-        if (_mode == HallwayLightMode.Broken)
+        if (_mode == HallwayLightMode.Broken || _floorVisibilityAlpha <= 0.005f)
         {
             _light2D.enabled = false;
-            _bulbRenderer.color = new Color(0.18f, 0.18f, 0.18f, 0.6f);
+            _bulbRenderer.color = new Color(0.18f, 0.18f, 0.18f, 0.6f * _floorVisibilityAlpha);
             return;
         }
 
         _light2D.enabled = true;
-        _light2D.intensity = _baseIntensity * intensityMultiplier;
+        _light2D.intensity = _baseIntensity * intensityMultiplier * _floorVisibilityAlpha;
 
-        float bulbAlpha = Mathf.Clamp(0.25f + 0.7f * intensityMultiplier, 0.15f, 0.95f);
+        float bulbAlpha = Mathf.Clamp(0.25f + 0.7f * intensityMultiplier, 0.15f, 0.95f) * _floorVisibilityAlpha;
         _bulbRenderer.color = new Color(_lightColor.r, _lightColor.g, _lightColor.b, bulbAlpha);
     }
 }

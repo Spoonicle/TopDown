@@ -56,7 +56,7 @@ public class FactoryMapConfig : ScriptableObject
     [Header("Doors & Interior Cover")]
     [Tooltip("Probability (0–1) that a room doorway spawns a physics-pushed swinging door.")]
     [Range(0f, 1f)]
-    [SerializeField] private float _doorSpawnChance = 0.9f;
+    [SerializeField] private float _doorSpawnChance = 1f;
 
     [Tooltip("Minimum number of concrete cover pillars/crates spawned inside each room.")]
     [Range(0, 8)]

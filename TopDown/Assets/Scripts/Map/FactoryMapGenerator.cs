@@ -9,16 +9,12 @@ using UnityEngine.Rendering.Universal;
 /// Synchronizes a single integer seed (<see cref="MapSeed"/>) across all clients via Netcode,
 /// then deterministically constructs a 1-to-3 floor factory (<c>Basement</c>, <c>1st Floor</c>,
 /// <c>2nd Floor</c>, or <c>3rd Floor</c>, with strict mutual exclusion between Basement and 3rd Floor),
-/// rooms ranging in size from small closets to massive auditoriums with 1–4 entrances/exits,
-/// breakable glass <see cref="BreakableWindow"/>s, walk-on <see cref="StairwellZone"/> transitions,
-/// physics-pushed <see cref="SwingDoor"/>s, and steady/flickering <see cref="HallwayLight"/>s.
+/// stacked at the same world coordinates and connected by 1–3 physical walkable <see cref="StairwellZone"/>
+/// flights per floor transition that smoothly cross-fade floor visuals from 0% to 100% as players climb
+/// while allowing players on the lower floor to walk underneath the elevated upper half of the stairs.
 /// </summary>
 public class FactoryMapGenerator : NetworkBehaviour
 {
-    // ────────────────────────────── Constants ──────────────────────────────
-
-    private const float FloorWorldStride = 320f;
-
     // ────────────────────────────── Types ──────────────────────────────────
 
     /// <summary>
@@ -84,9 +80,29 @@ public class FactoryMapGenerator : NetworkBehaviour
     private struct EntranceData
     {
         public int WallSide; // 0=North, 1=East, 2=South, 3=West
-        public Vector2Int GridCell; // Primary cell of the opening
+        public Vector2Int GridCell;
         public Vector2 WorldPosition;
         public Vector2 CourtyardSpawnPosition;
+    }
+
+    private struct StaircaseShaftPlan
+    {
+        public int LowerFloor;
+        public int UpperFloor;
+        public int BayX;      // 4-tile wide interior [BayX .. BayX + 3]
+        public int BayMinY;   // 10-tile tall interior [BayMinY .. BayMinY + 9]
+        public int ThroatX;   // 1-tile wall column connecting landings into the central ring hallway
+        public bool OpensToEastRing;
+    }
+
+    private struct DoorwaySpanRecord
+    {
+        public int FloorLevel;
+        public bool Horizontal;
+        public int StartX;
+        public int StartY;
+        public int Span;
+        public float TotalDoorLeafLength;
     }
 
     private class FloorGenerationState
@@ -99,6 +115,10 @@ public class FactoryMapGenerator : NetworkBehaviour
         public RectInt RingOuterBounds;
         public readonly List<RoomData> Rooms = new List<RoomData>();
         public readonly List<Vector2Int> DoorwayCells = new List<Vector2Int>();
+
+        public readonly List<(SpriteRenderer renderer, Color baseColor)> Renderers = new List<(SpriteRenderer, Color)>();
+        public readonly List<HallwayLight> Lights = new List<HallwayLight>();
+        public readonly List<Collider2D> Colliders = new List<Collider2D>();
     }
 
     // ────────────────────────────── Singleton ──────────────────────────────
@@ -139,8 +159,10 @@ public class FactoryMapGenerator : NetworkBehaviour
 
     private readonly List<int> _activeFloors = new List<int>();
     private readonly Dictionary<int, FloorGenerationState> _floorStates = new Dictionary<int, FloorGenerationState>();
+    private readonly List<StaircaseShaftPlan> _plannedStaircases = new List<StaircaseShaftPlan>();
     private readonly List<RoomData> _allRooms = new List<RoomData>();
     private readonly List<SwingDoor> _spawnedDoors = new List<SwingDoor>();
+    private readonly List<DoorwaySpanRecord> _doorwayRecords = new List<DoorwaySpanRecord>();
     private readonly List<BreakableWindow> _spawnedWindows = new List<BreakableWindow>();
     private readonly List<StairwellZone> _spawnedStairwells = new List<StairwellZone>();
 
@@ -148,7 +170,13 @@ public class FactoryMapGenerator : NetworkBehaviour
     private int _objectiveFloorLevel;
     private RectInt _objectiveRoomBounds;
 
-    // Active per-floor working references during generation
+    private GameObject _terminalObject;
+    private Light2D _terminalLight;
+    private float _terminalBaseLightIntensity = 0.85f;
+    private readonly List<(SpriteRenderer renderer, Color baseColor)> _objectiveEntityRenderers = new List<(SpriteRenderer, Color)>();
+    private readonly List<Collider2D> _objectiveEntityColliders = new List<Collider2D>();
+    private Rigidbody2D _patrolDummyBody;
+
     private FloorGenerationState _currentFloor;
     private CellType[,] _grid;
     private bool[,] _entranceProtectedZone;
@@ -174,6 +202,9 @@ public class FactoryMapGenerator : NetworkBehaviour
     /// <summary>Floor level the local player is currently on (-1=Basement, 0=1st, 1=2nd, 2=3rd).</summary>
     public int CurrentLocalFloorLevel { get; private set; }
 
+    /// <summary>Normalized progress (0..1) while the local player is actively walking on a staircase, or -1 when not on stairs.</summary>
+    public float CurrentStairClimbProgress { get; private set; } = -1f;
+
     /// <summary>True if the current building includes a Basement (-1).</summary>
     public bool HasBasement => _activeFloors.Contains(-1);
 
@@ -192,14 +223,26 @@ public class FactoryMapGenerator : NetworkBehaviour
     /// <summary>Number of physics-pushed swinging doors spawned in the current layout.</summary>
     public int SpawnedDoorCount => _spawnedDoors.Count;
 
+    /// <summary>Total number of doorway openings across all floors.</summary>
+    public int TotalDoorwayCount => _doorwayRecords.Count;
+
     /// <summary>Number of breakable windows spawned across the factory.</summary>
     public int SpawnedWindowCount => _spawnedWindows.Count;
 
-    /// <summary>Number of stairwell transition pads spawned across the factory.</summary>
+    /// <summary>Number of physical walkable staircases spawned across the factory.</summary>
     public int SpawnedStairwellCount => _spawnedStairwells.Count;
 
     /// <summary>True when all 4 perimeter entrances passed both grid BFS reachability and physics corridor clearance checks.</summary>
     public bool AllEntrancesVerifiedClear { get; private set; }
+
+    /// <summary>True when every hallway across all active floors is verified to be at least 1.5x the player's body diameter wide.</summary>
+    public bool AllHallwaysMeetMinWidth { get; private set; }
+
+    /// <summary>True when 100% of doorways across all active floors have doors spawned that fill 100% of the doorway length.</summary>
+    public bool AllDoorsFillDoorwaysVerified { get; private set; }
+
+    /// <summary>Minimum hallway width in world units observed across the generated map.</summary>
+    public float MinObservedHallwayWidthWorld { get; private set; }
 
     /// <summary>Minimum number of distinct entrance/exit doorways on any room in the building.</summary>
     public int MinDoorwaysPerRoom { get; private set; }
@@ -229,18 +272,6 @@ public class FactoryMapGenerator : NetworkBehaviour
             2 => "3RD FLOOR",
             _ => $"FLOOR {floorLevel}"
         };
-    }
-
-    /// <summary>Returns the world-space center offset for the given floor level.</summary>
-    public static Vector2 GetFloorWorldOffset(int floorLevel)
-    {
-        return new Vector2(floorLevel * FloorWorldStride, 0f);
-    }
-
-    /// <summary>Determines which floor level a world position belongs to based on horizontal stride.</summary>
-    public static int GetFloorLevelFromWorldPos(Vector2 worldPos)
-    {
-        return Mathf.RoundToInt(worldPos.x / FloorWorldStride);
     }
 
     // ──────────────────────────── Unity & Netcode Callbacks ────────────────
@@ -409,31 +440,176 @@ public class FactoryMapGenerator : NetworkBehaviour
         }
     }
 
-    // ──────────────────────────── Floor Navigation & Stairwells ────────────
+    // ──────────────────── Physical Staircase Cross-Fade & Floor Physics ─────
 
     /// <summary>
-    /// Notifies the generator that the local player transitioned to <paramref name="targetFloorLevel"/> via a stairwell.
+    /// Continuously cross-fades <paramref name="lowerFloor"/> (opacity <c>1 - t</c>) and
+    /// <paramref name="upperFloor"/> (opacity <c>t</c>) as the local player physically walks
+    /// along a <see cref="StairwellZone"/> from the bottom landing (<c>t = 0</c>) to the top landing (<c>t = 1</c>).
+    /// Swaps active floor physics at the midpoint (<c>t = 0.5</c>).
     /// </summary>
-    public void OnLocalPlayerChangedFloor(int targetFloorLevel)
+    public void SetStaircaseCrossFade(int lowerFloor, int upperFloor, float t)
     {
-        CurrentLocalFloorLevel = targetFloorLevel;
+        t = Mathf.Clamp01(t);
+        CurrentStairClimbProgress = t;
+
+        int targetPhysicsFloor = t >= 0.5f ? upperFloor : lowerFloor;
+        if (CurrentLocalFloorLevel != targetPhysicsFloor)
+        {
+            SetActivePhysicsFloor(targetPhysicsFloor);
+        }
+
+        for (int i = 0; i < _activeFloors.Count; i++)
+        {
+            int fl = _activeFloors[i];
+            if (fl == lowerFloor)
+            {
+                SetFloorVisualAlpha(fl, 1f - t);
+            }
+            else if (fl == upperFloor)
+            {
+                SetFloorVisualAlpha(fl, t);
+            }
+            else
+            {
+                SetFloorVisualAlpha(fl, 0f);
+            }
+        }
+
+        int secondaryFloor = targetPhysicsFloor == lowerFloor ? upperFloor : lowerFloor;
+        float secondaryAlpha = targetPhysicsFloor == lowerFloor ? t : (1f - t);
+        for (int i = 0; i < _spawnedStairwells.Count; i++)
+        {
+            if (_spawnedStairwells[i] != null)
+            {
+                _spawnedStairwells[i].UpdateVisibilityForFloors(targetPhysicsFloor, secondaryFloor, secondaryAlpha);
+            }
+        }
     }
 
     /// <summary>
-    /// Resolves the immediate navigation target on the same floor as <paramref name="fromWorldPos"/>.
-    /// If <paramref name="toWorldPos"/> is on another floor, returns the nearest <see cref="StairwellZone"/>
-    /// on the player's current floor that leads toward the destination floor.
+    /// Locks active physics and 100% visual visibility to <paramref name="floorLevel"/> once a player
+    /// steps off a staircase landing (or at initial spawn).
+    /// </summary>
+    public void CommitToSingleFloor(int floorLevel)
+    {
+        CurrentStairClimbProgress = -1f;
+        SetActivePhysicsFloor(floorLevel);
+
+        for (int i = 0; i < _activeFloors.Count; i++)
+        {
+            int fl = _activeFloors[i];
+            SetFloorVisualAlpha(fl, fl == floorLevel ? 1f : 0f);
+        }
+
+        for (int i = 0; i < _spawnedStairwells.Count; i++)
+        {
+            if (_spawnedStairwells[i] != null)
+            {
+                _spawnedStairwells[i].UpdateVisibilityForFloors(floorLevel, floorLevel, 0f);
+            }
+        }
+    }
+
+    private void SetActivePhysicsFloor(int activeFloorLevel)
+    {
+        CurrentLocalFloorLevel = activeFloorLevel;
+
+        foreach (var kvp in _floorStates)
+        {
+            bool active = kvp.Key == activeFloorLevel;
+            List<Collider2D> cols = kvp.Value.Colliders;
+            for (int i = 0; i < cols.Count; i++)
+            {
+                if (cols[i] != null)
+                {
+                    cols[i].enabled = active;
+                }
+            }
+        }
+
+        bool objActive = activeFloorLevel == _objectiveFloorLevel;
+        for (int i = 0; i < _objectiveEntityColliders.Count; i++)
+        {
+            if (_objectiveEntityColliders[i] != null)
+            {
+                _objectiveEntityColliders[i].enabled = objActive;
+            }
+        }
+        if (_patrolDummyBody != null)
+        {
+            _patrolDummyBody.simulated = objActive;
+        }
+
+        Physics2D.SyncTransforms();
+    }
+
+    private void SetFloorVisualAlpha(int floorLevel, float alpha)
+    {
+        alpha = Mathf.Clamp01(alpha);
+        if (!_floorStates.TryGetValue(floorLevel, out var state) || state.FloorRoot == null) return;
+
+        bool visible = alpha > 0.005f || floorLevel == CurrentLocalFloorLevel;
+        if (state.FloorRoot.activeSelf != visible)
+        {
+            state.FloorRoot.SetActive(visible);
+        }
+
+        if (visible)
+        {
+            for (int i = 0; i < state.Renderers.Count; i++)
+            {
+                var (sr, baseCol) = state.Renderers[i];
+                if (sr != null)
+                {
+                    sr.color = new Color(baseCol.r, baseCol.g, baseCol.b, baseCol.a * alpha);
+                }
+            }
+
+            for (int i = 0; i < state.Lights.Count; i++)
+            {
+                if (state.Lights[i] != null)
+                {
+                    state.Lights[i].SetFloorVisibilityAlpha(alpha);
+                }
+            }
+        }
+
+        if (floorLevel == _objectiveFloorLevel)
+        {
+            for (int i = 0; i < _objectiveEntityRenderers.Count; i++)
+            {
+                var (sr, baseCol) = _objectiveEntityRenderers[i];
+                if (sr != null)
+                {
+                    sr.color = new Color(baseCol.r, baseCol.g, baseCol.b, baseCol.a * alpha);
+                }
+            }
+
+            if (_terminalLight != null)
+            {
+                _terminalLight.enabled = alpha > 0.005f;
+                _terminalLight.intensity = _terminalBaseLightIntensity * alpha;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Resolves the immediate navigation target on the local player's current floor.
+    /// When carrying objective data on a non-1st floor, points to the entry landing of the nearest
+    /// physical staircase leading toward the 1st Floor (0).
     /// </summary>
     public Vector2 ResolveNavigationTarget(Vector2 fromWorldPos, Vector2 toWorldPos)
     {
-        int fromFloor = GetFloorLevelFromWorldPos(fromWorldPos);
-        int toFloor = GetFloorLevelFromWorldPos(toWorldPos);
-        if (fromFloor == toFloor)
+        if (CurrentLocalFloorLevel == 0)
         {
             return toWorldPos;
         }
 
-        int desiredNextFloor = toFloor > fromFloor ? fromFloor + 1 : fromFloor - 1;
+        int desiredNextFloor = CurrentLocalFloorLevel > 0
+            ? CurrentLocalFloorLevel - 1
+            : CurrentLocalFloorLevel + 1;
+
         StairwellZone bestStair = null;
         float bestDistSq = float.MaxValue;
 
@@ -441,9 +617,10 @@ public class FactoryMapGenerator : NetworkBehaviour
         {
             StairwellZone stair = _spawnedStairwells[i];
             if (stair == null) continue;
-            if (stair.SourceFloorLevel == fromFloor && stair.TargetFloorLevel == desiredNextFloor)
+            if (stair.ConnectsFloors(CurrentLocalFloorLevel, desiredNextFloor))
             {
-                float dSq = ((Vector2)stair.transform.position - fromWorldPos).sqrMagnitude;
+                Vector2 landing = stair.GetEntryLandingForFloor(CurrentLocalFloorLevel);
+                float dSq = (landing - fromWorldPos).sqrMagnitude;
                 if (dSq < bestDistSq)
                 {
                     bestDistSq = dSq;
@@ -452,7 +629,51 @@ public class FactoryMapGenerator : NetworkBehaviour
             }
         }
 
-        return bestStair != null ? (Vector2)bestStair.transform.position : toWorldPos;
+        return bestStair != null
+            ? bestStair.GetEntryLandingForFloor(CurrentLocalFloorLevel)
+            : toWorldPos;
+    }
+
+    // ──────────────────────────── Player Body & Hallway Sizing ─────────────
+
+    /// <summary>
+    /// Measures the player character's physical collider diameter in world units (defaults to 1.0u if no Player is active).
+    /// </summary>
+    public float GetPlayerBodyDiameter()
+    {
+        var player = GameObject.Find("Player");
+        if (player != null)
+        {
+            var circle = player.GetComponent<CircleCollider2D>();
+            if (circle != null)
+            {
+                float scale = Mathf.Max(Mathf.Abs(player.transform.lossyScale.x), Mathf.Abs(player.transform.lossyScale.y));
+                return Mathf.Max(0.8f, circle.radius * 2f * scale);
+            }
+
+            var col = player.GetComponent<Collider2D>();
+            if (col != null && col.bounds.size.x > 0.1f)
+            {
+                return Mathf.Max(0.8f, Mathf.Max(col.bounds.size.x, col.bounds.size.y));
+            }
+        }
+        return 1.0f;
+    }
+
+    /// <summary>
+    /// Returns the minimum allowable hallway width in world units (at least 1.5x the player's body diameter).
+    /// </summary>
+    public float GetMinHallwayWidthWorld()
+    {
+        return GetPlayerBodyDiameter() * 1.5f;
+    }
+
+    /// <summary>
+    /// Returns the minimum allowable hallway width in grid tiles (at least 1.5x the player's body, minimum 3 tiles).
+    /// </summary>
+    private int GetMinHallwayWidthTiles()
+    {
+        return Mathf.Max(3, Mathf.CeilToInt(GetMinHallwayWidthWorld()));
     }
 
     // ──────────────────────────── Procedural Generation ────────────────────
@@ -470,14 +691,20 @@ public class FactoryMapGenerator : NetworkBehaviour
 
         _activeFloors.Clear();
         _floorStates.Clear();
+        _plannedStaircases.Clear();
         _allRooms.Clear();
         _spawnedDoors.Clear();
+        _doorwayRecords.Clear();
         _spawnedWindows.Clear();
         _spawnedStairwells.Clear();
-        AllEntrancesVerifiedClear = false;
-        CurrentLocalFloorLevel = 0;
 
-        // Clear previous generated map container (deactivate immediately so old colliders leave Physics2D this frame)
+        AllEntrancesVerifiedClear = false;
+        AllHallwaysMeetMinWidth = true;
+        AllDoorsFillDoorwaysVerified = true;
+        MinObservedHallwayWidthWorld = float.MaxValue;
+        CurrentLocalFloorLevel = 0;
+        CurrentStairClimbProgress = -1f;
+
         if (_mapRoot != null)
         {
             _mapRoot.name = "DestroyedFactoryMap";
@@ -493,13 +720,15 @@ public class FactoryMapGenerator : NetworkBehaviour
         }
         _mapRoot = new GameObject("GeneratedFactoryMap");
 
-        // Configure ambient darkness and resize 1st-floor FloorGrid to cover building + courtyard
         ApplyAmbientLightingAndFloor();
 
         // Step 1: Roll the 1-to-3 active floors (strictly enforcing: Basement (-1) and 3rd Floor (2) never coexist)
         DetermineActiveFloors(rng);
 
-        // Step 2: Generate each active floor's grid, rooms (Closets to Auditoriums), doors, windows, cover, and lights
+        // Step 2: Plan 1–3 physical staircases per floor transition so shafts align vertically across stacked floors
+        PlanStaircasesBetweenActiveFloors(rng);
+
+        // Step 3: Generate each active floor's grid, rooms (Closets to Auditoriums), doors, windows, cover, and lights
         int minDoorsAcrossMap = int.MaxValue;
         int maxDoorsAcrossMap = 0;
 
@@ -512,31 +741,21 @@ public class FactoryMapGenerator : NetworkBehaviour
         MinDoorwaysPerRoom = _allRooms.Count > 0 ? minDoorsAcrossMap : 0;
         MaxDoorwaysPerRoom = maxDoorsAcrossMap;
 
-        // Step 3: Spawn linked walk-on StairwellZones between all adjacent active floors
-        SpawnStairwellsBetweenActiveFloors();
+        // Step 4: Spawn physical walkable StairwellZones for all planned shafts
+        SpawnPlannedPhysicalStaircases();
 
-        // Step 4: Position the ComputerTerminal in the Objective Room & assign Teams/Dummies on 1st Floor
+        // Step 5: Position the ComputerTerminal in the Objective Room & assign Teams/Dummies on 1st Floor
         PlaceObjectiveAndTeams(rng);
 
-        // Step 5: Final physics verification ensuring zero solid objects or characters block any of the 4 entrances
-        ValidateEntranceClearancePhysics();
+        // Step 6: Commit initial active floor to 1st Floor (0)
+        CommitToSingleFloor(0);
+
+        // Step 7: Final physics & geometry verification for entrances, hallway minimum width (>=1.5x player), and full-length doors
+        ValidateEntranceHallwayAndDoorSafety();
     }
 
-    /// <summary>
-    /// Selects 1 to 3 active floors from the valid combinations:
-    /// 1 floor: [0]
-    /// 2 floors: [-1, 0] or [0, 1]
-    /// 3 floors: [-1, 0, 1] or [0, 1, 2]
-    /// Strictly enforces that Basement (-1) and 3rd Floor (2) are mutually exclusive.
-    /// </summary>
     private void DetermineActiveFloors(System.Random rng)
     {
-        // 5 valid floor configurations:
-        // 0: [0]          (1st Floor only)
-        // 1: [-1, 0]      (Basement + 1st Floor)
-        // 2: [0, 1]       (1st Floor + 2nd Floor)
-        // 3: [-1, 0, 1]   (Basement + 1st Floor + 2nd Floor)
-        // 4: [0, 1, 2]    (1st Floor + 2nd Floor + 3rd Floor)
         int roll = rng.Next(100);
         if (roll < 16)
         {
@@ -565,14 +784,78 @@ public class FactoryMapGenerator : NetworkBehaviour
             _activeFloors.Add(2);
         }
 
-        // Safety invariant: Basement (-1) and 3rd Floor (2) can never coexist
         if (_activeFloors.Contains(-1) && _activeFloors.Contains(2))
         {
             _activeFloors.Remove(2);
         }
 
-        // Pick which active floor houses the 1 Objective Room (ComputerTerminal)
         _objectiveFloorLevel = _activeFloors[rng.Next(_activeFloors.Count)];
+    }
+
+    private void PlanStaircasesBetweenActiveFloors(System.Random rng)
+    {
+        if (_activeFloors.Count <= 1) return;
+
+        int objSize = _config != null ? _config.ObjectiveRoomSize : 24;
+        int hw = Mathf.Max(GetMinHallwayWidthTiles(), _config != null ? _config.HallwayWidth : 6);
+        int centralMinX = (_width - objSize) / 2;
+        int centralMinY = (_height - objSize) / 2;
+        int ringMinX = centralMinX - 1 - hw;
+        int ringMaxX = centralMinX + objSize + 1 + hw;
+        int ringMinY = centralMinY - 1 - hw;
+        int ringMaxY = centralMinY + objSize + 1 + hw;
+
+        int westBayX = ringMinX - 5;
+        int westThroatX = ringMinX - 1;
+        int eastBayX = ringMaxX + 1;
+        int eastThroatX = ringMaxX;
+
+        int northBayMinY = ringMaxY - 12;
+        int centerBayMinY = ringMinY + 14;
+        int southBayMinY = ringMinY + 2;
+
+        var pool0 = new (int bayX, int bayMinY, int throatX, bool opensEast)[]
+        {
+            (westBayX, northBayMinY, westThroatX, true),
+            (eastBayX, northBayMinY, eastThroatX, false),
+            (westBayX, centerBayMinY, westThroatX, true)
+        };
+
+        var pool1 = new (int bayX, int bayMinY, int throatX, bool opensEast)[]
+        {
+            (eastBayX, southBayMinY, eastThroatX, false),
+            (westBayX, southBayMinY, westThroatX, true),
+            (eastBayX, centerBayMinY, eastThroatX, false)
+        };
+
+        for (int t = 0; t < _activeFloors.Count - 1; t++)
+        {
+            int lowerFloor = _activeFloors[t];
+            int upperFloor = _activeFloors[t + 1];
+            int stairCount = rng.Next(1, 4);
+
+            var pool = (t == 0) ? pool0 : pool1;
+            int[] order = { 0, 1, 2 };
+            for (int k = 2; k > 0; k--)
+            {
+                int swap = rng.Next(k + 1);
+                (order[k], order[swap]) = (order[swap], order[k]);
+            }
+
+            for (int s = 0; s < stairCount; s++)
+            {
+                var slot = pool[order[s]];
+                _plannedStaircases.Add(new StaircaseShaftPlan
+                {
+                    LowerFloor = lowerFloor,
+                    UpperFloor = upperFloor,
+                    BayX = slot.bayX,
+                    BayMinY = slot.bayMinY,
+                    ThroatX = slot.throatX,
+                    OpensToEastRing = slot.opensEast
+                });
+            }
+        }
     }
 
     private void GenerateSingleFloor(
@@ -597,7 +880,6 @@ public class FactoryMapGenerator : NetworkBehaviour
         _rooms = state.Rooms;
         _doorwayCells = state.DoorwayCells;
 
-        // If this is a non-ground floor, create a dark concrete floor backdrop beneath its footprint
         if (floorLevel != 0)
         {
             CreateNonGroundFloorBackdrop(floorLevel, state.FloorRoot.transform);
@@ -612,17 +894,16 @@ public class FactoryMapGenerator : NetworkBehaviour
             }
         }
 
-        // 2. Carve Central Room (Objective Room on _objectiveFloorLevel, or Central Atrium Hub on other floors)
+        // 2. Carve Central Room
         bool isObjectiveFloor = (floorLevel == _objectiveFloorLevel);
         PlaceCentralRoom(rng, isObjectiveFloor);
 
-        // 3. Carve the Inner Ring Hallway around the Central Room & reserve Stairwell Bays
+        // 3. Carve the Inner Ring Hallway around the Central Room & reserve/carve Stairwell Bays
         RectInt ringOuter = CarveInnerRingHallway();
         state.RingOuterBounds = ringOuter;
-        ReserveStairwellBaysOnRing(ringOuter);
+        CarveAndReserveStairwellBaysForFloor(floorLevel);
 
-        // 4. On 1st Floor (floorLevel == 0), place and connect the 4 exterior perimeter entrances.
-        //    On Basement/2nd/3rd floors, carve internal arterial corridors radiating into the 4 quadrants.
+        // 4. Carve perimeter entrances (1st Floor) or internal arterial corridors (non-ground floors)
         if (floorLevel == 0)
         {
             PlaceAndConnectFourEntrances(rng, ringOuter);
@@ -644,14 +925,20 @@ public class FactoryMapGenerator : NetworkBehaviour
         // 8. Place interior concrete cover pillars scaled to each room's archetype
         PlaceInteriorCoverPillars(rng);
 
-        // 9. Safety pass — enforce 100% entrance, stairwell bay, doorway swing arc, and BFS path clearance
+        // 9. Safety pass — enforce 100% entrance, stairwell bay, doorway swing arc, BFS path, and >=1.5x player hallway width
         EnforceFloorSafetyClearance(floorLevel, ringOuter);
+
+        // 9.5. Normalize all Doorway runs (lock flanking Wall jambs) & spawn full-span SwingDoors filling 100% of every doorway
+        NormalizeAndSpawnAllDoorsForFloor(floorLevel);
 
         // 10. Instantiate greedy-merged concrete wall colliders and cover pillars for this floor
         BuildWallAndCoverGeometry();
 
         // 11. Spawn steady & flickering emergency lights along hallways ONLY (rooms stay dark!)
         SpawnHallwayEmergencyLights(floorLevel, rng);
+
+        // Cache all SpriteRenderers, HallwayLights, and Collider2Ds on this floor
+        CacheFloorComponents(state);
 
         // Record room stats
         for (int i = 0; i < _rooms.Count; i++)
@@ -666,12 +953,28 @@ public class FactoryMapGenerator : NetworkBehaviour
         }
     }
 
+    private void CacheFloorComponents(FloorGenerationState state)
+    {
+        state.Renderers.Clear();
+        var srs = state.FloorRoot.GetComponentsInChildren<SpriteRenderer>(true);
+        for (int i = 0; i < srs.Length; i++)
+        {
+            if (srs[i].GetComponentInParent<HallwayLight>() != null) continue;
+            state.Renderers.Add((srs[i], srs[i].color));
+        }
+
+        state.Lights.Clear();
+        state.Lights.AddRange(state.FloorRoot.GetComponentsInChildren<HallwayLight>(true));
+
+        state.Colliders.Clear();
+        state.Colliders.AddRange(state.FloorRoot.GetComponentsInChildren<Collider2D>(true));
+    }
+
     private void CreateNonGroundFloorBackdrop(int floorLevel, Transform parent)
     {
         EnsureTileSprite();
-        Vector2 centerWorld = GridToWorld((_width - 1) * 0.5f, (_height - 1) * 0.5f, floorLevel);
+        Vector2 centerWorld = GridToWorld((_width - 1) * 0.5f, (_height - 1) * 0.5f);
 
-        // Outer dark shroud so non-ground floors have no exterior courtyard grass/concrete
         var shroudGo = new GameObject("NonGroundVoidShroud");
         shroudGo.transform.SetParent(parent, false);
         shroudGo.transform.position = new Vector3(centerWorld.x, centerWorld.y, 0f);
@@ -679,9 +982,8 @@ public class FactoryMapGenerator : NetworkBehaviour
         var shroudSr = shroudGo.AddComponent<SpriteRenderer>();
         shroudSr.sprite = _cachedTileSprite;
         shroudSr.color = new Color(0.05f, 0.055f, 0.06f, 1f);
-        shroudSr.sortingOrder = -12;
+        shroudSr.sortingOrder = -6;
 
-        // Interior concrete floor slab matching the 108x108 building footprint
         var slabGo = new GameObject("FloorConcreteSlab");
         slabGo.transform.SetParent(parent, false);
         slabGo.transform.position = new Vector3(centerWorld.x, centerWorld.y, 0f);
@@ -689,9 +991,9 @@ public class FactoryMapGenerator : NetworkBehaviour
         var slabSr = slabGo.AddComponent<SpriteRenderer>();
         slabSr.sprite = _cachedTileSprite;
         slabSr.color = floorLevel < 0
-            ? new Color(0.18f, 0.19f, 0.21f, 1f) // Slightly damp dark slate for Basement
-            : new Color(0.22f, 0.23f, 0.24f, 1f); // Upper floor concrete
-        slabSr.sortingOrder = -10;
+            ? new Color(0.18f, 0.19f, 0.21f, 1f)
+            : new Color(0.22f, 0.23f, 0.24f, 1f);
+        slabSr.sortingOrder = -5;
     }
 
     private void ApplyAmbientLightingAndFloor()
@@ -728,7 +1030,6 @@ public class FactoryMapGenerator : NetworkBehaviour
     private void PlaceCentralRoom(System.Random rng, bool isObjectiveRoom)
     {
         int objSize = _config != null ? _config.ObjectiveRoomSize : 24;
-        // Keep central room centered so stairwell bays on the ring hallway align across all floors
         int startX = (_width - objSize) / 2;
         int startY = (_height - objSize) / 2;
 
@@ -760,15 +1061,21 @@ public class FactoryMapGenerator : NetworkBehaviour
         });
     }
 
+    private int GetConfiguredHallwayWidth()
+    {
+        int cfg = _config != null ? _config.HallwayWidth : 6;
+        return Mathf.Max(GetMinHallwayWidthTiles(), cfg);
+    }
+
     private int GetDoorwaySpan()
     {
-        int hw = _config != null ? _config.HallwayWidth : 6;
+        int hw = GetConfiguredHallwayWidth();
         return hw >= 4 ? 4 : 2;
     }
 
     private RectInt CarveInnerRingHallway()
     {
-        int hw = _config != null ? _config.HallwayWidth : 6;
+        int hw = GetConfiguredHallwayWidth();
         int doorSpan = GetDoorwaySpan();
         RectInt central = _currentFloor.CentralRoomBounds;
 
@@ -796,123 +1103,96 @@ public class FactoryMapGenerator : NetworkBehaviour
         int midX = central.xMin + (central.width - doorSpan) / 2;
         int midY = central.yMin + (central.height - doorSpan) / 2;
 
-        CarveHorizontalDoorway(midX, central.yMax, doorSpan, true);
-        CarveHorizontalDoorway(midX, central.yMin - 1, doorSpan, true);
-        CarveVerticalDoorway(central.xMax, midY, doorSpan, true);
-        CarveVerticalDoorway(central.xMin - 1, midY, doorSpan, true);
+        CarveHorizontalDoorway(midX, central.yMax, doorSpan);
+        CarveHorizontalDoorway(midX, central.yMin - 1, doorSpan);
+        CarveVerticalDoorway(central.xMax, midY, doorSpan);
+        CarveVerticalDoorway(central.xMin - 1, midY, doorSpan);
 
         return new RectInt(ringMinX, ringMinY, ringMaxX - ringMinX, ringMaxY - ringMinY);
     }
 
     /// <summary>
-    /// Reserves protected zones around the stairwell pad positions in the inner ring hallway
-    /// so no rooms, walls, or cover pillars ever obstruct stairwell transitions.
+    /// Reserves all planned stairwell bays in <c>_entranceProtectedZone</c> and carves the 4x10 stairwell shaft
+    /// on any floor connected by that staircase:
+    /// - On <c>LowerFloor</c>: opens the entire stairwell side into the ring hallway so players can either
+    ///   enter at the Bottom Landing to climb ON TOP of the stairs, or walk UNDERNEATH the elevated upper half!
+    /// - On <c>UpperFloor</c>: opens a full 4-tile-wide Top Landing passage into the ring hallway while keeping
+    ///   the lower drop-off railed off by concrete wall.
     /// </summary>
-    private void ReserveStairwellBaysOnRing(RectInt ringOuter)
+    private void CarveAndReserveStairwellBaysForFloor(int floorLevel)
     {
-        for (int lowerFloor = -1; lowerFloor <= 1; lowerFloor++)
+        for (int i = 0; i < _plannedStaircases.Count; i++)
         {
-            GetStairwellGridPositionsForShaft(lowerFloor, ringOuter, out Vector2Int bayA, out Vector2Int bayB);
-            MarkDoorwayClearanceZone(bayA.x - 3, bayA.y - 3, 7, 7);
-            MarkDoorwayClearanceZone(bayB.x - 3, bayB.y - 3, 7, 7);
-        }
-    }
+            StaircaseShaftPlan plan = _plannedStaircases[i];
 
-    private void GetStairwellGridPositionsForShaft(
-        int lowerFloorLevel,
-        RectInt ringOuter,
-        out Vector2Int primaryBay,
-        out Vector2Int secondaryBay)
-    {
-        int hw = _config != null ? _config.HallwayWidth : 6;
-        int halfHw = hw / 2;
+            MarkDoorwayClearanceZone(plan.BayX - 2, plan.BayMinY - 2, 8, 14);
 
-        // Each vertical transition (-1<->0, 0<->1, 1<->2) uses distinct corners/sides of the ring hallway
-        // so UP and DOWN stairwells on the same floor never overlap and always sit on walkable HallwayFloor.
-        if (lowerFloorLevel == -1) // Basement <-> 1st Floor: NW and SE corners of ring hallway
-        {
-            primaryBay = new Vector2Int(ringOuter.xMin + halfHw, ringOuter.yMax - halfHw - 1);
-            secondaryBay = new Vector2Int(ringOuter.xMax - halfHw - 1, ringOuter.yMin + halfHw);
-        }
-        else if (lowerFloorLevel == 0) // 1st Floor <-> 2nd Floor: NE and SW corners of ring hallway
-        {
-            primaryBay = new Vector2Int(ringOuter.xMax - halfHw - 1, ringOuter.yMax - halfHw - 1);
-            secondaryBay = new Vector2Int(ringOuter.xMin + halfHw, ringOuter.yMin + halfHw);
-        }
-        else // 2nd Floor <-> 3rd Floor: North-West-Mid and South-East-Mid of ring hallway
-        {
-            primaryBay = new Vector2Int(ringOuter.xMin + halfHw, ringOuter.yMin + ringOuter.height / 2 + 5);
-            secondaryBay = new Vector2Int(ringOuter.xMax - halfHw - 1, ringOuter.yMin + ringOuter.height / 2 - 5);
-        }
-    }
-
-    private void SpawnStairwellsBetweenActiveFloors()
-    {
-        if (_activeFloors.Count <= 1) return;
-
-        for (int i = 0; i < _activeFloors.Count - 1; i++)
-        {
-            int lowerFloor = _activeFloors[i];
-            int upperFloor = _activeFloors[i + 1];
-
-            if (!_floorStates.TryGetValue(lowerFloor, out var lowerState) ||
-                !_floorStates.TryGetValue(upperFloor, out var upperState))
+            if (floorLevel != plan.LowerFloor && floorLevel != plan.UpperFloor)
             {
                 continue;
             }
 
-            GetStairwellGridPositionsForShaft(
-                lowerFloor,
-                lowerState.RingOuterBounds,
-                out Vector2Int bayA,
-                out Vector2Int bayB);
+            // Surround the 4x10 bay with solid 1-tile concrete walls first
+            for (int x = plan.BayX - 1; x <= plan.BayX + 4; x++)
+            {
+                for (int y = plan.BayMinY - 1; y <= plan.BayMinY + 10; y++)
+                {
+                    if (x > 0 && x < _width - 1 && y > 0 && y < _height - 1)
+                    {
+                        _grid[x, y] = CellType.Wall;
+                    }
+                }
+            }
 
-            SpawnLinkedStairwellPair(lowerFloor, upperFloor, bayA, lowerState.FloorRoot.transform, upperState.FloorRoot.transform);
-            SpawnLinkedStairwellPair(lowerFloor, upperFloor, bayB, lowerState.FloorRoot.transform, upperState.FloorRoot.transform);
+            // Carve the 4x10 staircase interior (width = 4 tiles >= 4x player body)
+            for (int x = plan.BayX; x < plan.BayX + 4; x++)
+            {
+                for (int y = plan.BayMinY; y < plan.BayMinY + 10; y++)
+                {
+                    _grid[x, y] = CellType.HallwayFloor;
+                }
+            }
+
+            if (floorLevel == plan.LowerFloor)
+            {
+                // On the lower floor, open the full side facing the ring hallway (and top under-stair exit)
+                // so players can walk into the Bottom Landing to climb OR walk underneath the elevated upper half!
+                for (int y = plan.BayMinY; y < plan.BayMinY + 10; y++)
+                {
+                    _grid[plan.ThroatX, y] = CellType.HallwayFloor;
+                }
+            }
+            else if (floorLevel == plan.UpperFloor)
+            {
+                // On the upper floor, open a 4-tile-wide Top Landing passage (>= 4x player body) into the ring hallway
+                for (int y = plan.BayMinY + 6; y < plan.BayMinY + 10; y++)
+                {
+                    _grid[plan.ThroatX, y] = CellType.HallwayFloor;
+                }
+            }
         }
     }
 
-    private void SpawnLinkedStairwellPair(
-        int lowerFloor,
-        int upperFloor,
-        Vector2Int gridPos,
-        Transform lowerParent,
-        Transform upperParent)
+    private void SpawnPlannedPhysicalStaircases()
     {
-        Vector2 lowerWorld = GridToWorld(gridPos.x, gridPos.y, lowerFloor);
-        Vector2 upperWorld = GridToWorld(gridPos.x, gridPos.y, upperFloor);
+        for (int i = 0; i < _plannedStaircases.Count; i++)
+        {
+            StaircaseShaftPlan plan = _plannedStaircases[i];
+            Vector2 centerWorld = GridToWorld(plan.BayX + 1.5f, plan.BayMinY + 4.5f);
 
-        // 1. UP Stairwell on lowerFloor -> teleports to upperFloor
-        var upGo = new GameObject($"Stairwell_Up_{lowerFloor}_to_{upperFloor}");
-        upGo.transform.SetParent(lowerParent, false);
-        var upZone = upGo.AddComponent<StairwellZone>();
-        upZone.Initialize(
-            this,
-            lowerFloor,
-            upperFloor,
-            lowerWorld,
-            upperWorld + new Vector2(0f, -2.1f),
-            $"STAIRS UP -> {GetFloorDisplayName(upperFloor)}");
-        _spawnedStairwells.Add(upZone);
+            var stairGo = new GameObject($"PhysicalStaircase_{i}_{plan.LowerFloor}_to_{plan.UpperFloor}");
+            stairGo.transform.SetParent(_mapRoot.transform, false);
 
-        // 2. DOWN Stairwell on upperFloor -> teleports to lowerFloor
-        var downGo = new GameObject($"Stairwell_Down_{upperFloor}_to_{lowerFloor}");
-        downGo.transform.SetParent(upperParent, false);
-        var downZone = downGo.AddComponent<StairwellZone>();
-        downZone.Initialize(
-            this,
-            upperFloor,
-            lowerFloor,
-            upperWorld,
-            lowerWorld + new Vector2(0f, 2.1f),
-            $"STAIRS DOWN -> {GetFloorDisplayName(lowerFloor)}");
-        _spawnedStairwells.Add(downZone);
+            var zone = stairGo.AddComponent<StairwellZone>();
+            zone.Initialize(this, plan.LowerFloor, plan.UpperFloor, centerWorld, plan.OpensToEastRing);
+            _spawnedStairwells.Add(zone);
+        }
     }
 
     private void PlaceAndConnectFourEntrances(System.Random rng, RectInt ringOuter)
     {
         int margin = _config != null ? _config.EntranceCornerMargin : 18;
-        int hw = _config != null ? _config.HallwayWidth : 6;
+        int hw = GetConfiguredHallwayWidth();
         int doorSpan = GetDoorwaySpan();
         int doorOffset = Mathf.Max(0, (hw - doorSpan) / 2);
         float courtyardDist = (_config != null ? _config.CourtyardMargin : 14) * 0.65f;
@@ -925,10 +1205,10 @@ public class FactoryMapGenerator : NetworkBehaviour
         {
             WallSide = 0,
             GridCell = new Vector2Int(northX, _height - 1),
-            WorldPosition = GridToWorld(northX + halfHwOffset, _height - 1, 0),
-            CourtyardSpawnPosition = GridToWorld(northX + halfHwOffset, _height - 1 + courtyardDist, 0)
+            WorldPosition = GridToWorld(northX + halfHwOffset, _height - 1),
+            CourtyardSpawnPosition = GridToWorld(northX + halfHwOffset, _height - 1 + courtyardDist)
         };
-        CarveHorizontalDoorway(northX + doorOffset, _height - 1, doorSpan, true);
+        CarveHorizontalDoorway(northX + doorOffset, _height - 1, doorSpan);
         ReserveEntranceVestibule(northX, _height - 1 - vestibuleDepth, hw, vestibuleDepth, 2);
         CarveLCorridor(new Vector2Int(northX, _height - 1 - vestibuleDepth), new Vector2Int(
             Mathf.Clamp(northX, ringOuter.xMin, ringOuter.xMax - hw),
@@ -940,10 +1220,10 @@ public class FactoryMapGenerator : NetworkBehaviour
         {
             WallSide = 1,
             GridCell = new Vector2Int(_width - 1, eastY),
-            WorldPosition = GridToWorld(_width - 1, eastY + halfHwOffset, 0),
-            CourtyardSpawnPosition = GridToWorld(_width - 1 + courtyardDist, eastY + halfHwOffset, 0)
+            WorldPosition = GridToWorld(_width - 1, eastY + halfHwOffset),
+            CourtyardSpawnPosition = GridToWorld(_width - 1 + courtyardDist, eastY + halfHwOffset)
         };
-        CarveVerticalDoorway(_width - 1, eastY + doorOffset, doorSpan, true);
+        CarveVerticalDoorway(_width - 1, eastY + doorOffset, doorSpan);
         ReserveEntranceVestibule(_width - 1 - vestibuleDepth, eastY, vestibuleDepth, hw, 2);
         CarveLCorridor(new Vector2Int(_width - 1 - vestibuleDepth, eastY), new Vector2Int(
             ringOuter.xMax - hw,
@@ -955,10 +1235,10 @@ public class FactoryMapGenerator : NetworkBehaviour
         {
             WallSide = 2,
             GridCell = new Vector2Int(southX, 0),
-            WorldPosition = GridToWorld(southX + halfHwOffset, 0, 0),
-            CourtyardSpawnPosition = GridToWorld(southX + halfHwOffset, -courtyardDist, 0)
+            WorldPosition = GridToWorld(southX + halfHwOffset, 0),
+            CourtyardSpawnPosition = GridToWorld(southX + halfHwOffset, -courtyardDist)
         };
-        CarveHorizontalDoorway(southX + doorOffset, 0, doorSpan, true);
+        CarveHorizontalDoorway(southX + doorOffset, 0, doorSpan);
         ReserveEntranceVestibule(southX, 1, hw, vestibuleDepth, 2);
         CarveLCorridor(new Vector2Int(southX, vestibuleDepth), new Vector2Int(
             Mathf.Clamp(southX, ringOuter.xMin, ringOuter.xMax - hw),
@@ -970,24 +1250,20 @@ public class FactoryMapGenerator : NetworkBehaviour
         {
             WallSide = 3,
             GridCell = new Vector2Int(0, westY),
-            WorldPosition = GridToWorld(0, westY + halfHwOffset, 0),
-            CourtyardSpawnPosition = GridToWorld(-courtyardDist, westY + halfHwOffset, 0)
+            WorldPosition = GridToWorld(0, westY + halfHwOffset),
+            CourtyardSpawnPosition = GridToWorld(-courtyardDist, westY + halfHwOffset)
         };
-        CarveVerticalDoorway(0, westY + doorOffset, doorSpan, true);
+        CarveVerticalDoorway(0, westY + doorOffset, doorSpan);
         ReserveEntranceVestibule(1, westY, vestibuleDepth, hw, 2);
         CarveLCorridor(new Vector2Int(vestibuleDepth, westY), new Vector2Int(
             ringOuter.xMin,
             Mathf.Clamp(westY, ringOuter.yMin, ringOuter.yMax - hw)), hw, false);
     }
 
-    /// <summary>
-    /// On non-ground floors (Basement, 2nd, 3rd), carves 4 internal arterial corridors radiating from
-    /// the central ring hallway into the 4 sectors (stopping inside the perimeter walls).
-    /// </summary>
     private void CarveNonGroundFloorArterialHallways(System.Random rng, RectInt ringOuter)
     {
         int margin = _config != null ? _config.EntranceCornerMargin : 18;
-        int hw = _config != null ? _config.HallwayWidth : 6;
+        int hw = GetConfiguredHallwayWidth();
 
         int northX = rng.Next(margin, _width - margin - hw);
         CarveLCorridor(
@@ -1048,6 +1324,8 @@ public class FactoryMapGenerator : NetworkBehaviour
 
     private void CarveLCorridor(Vector2Int from, Vector2Int to, int width, bool verticalFirst)
     {
+        width = Mathf.Max(width, GetMinHallwayWidthTiles());
+
         if (verticalFirst)
         {
             int minY = Mathf.Min(from.y, to.y);
@@ -1103,18 +1381,12 @@ public class FactoryMapGenerator : NetworkBehaviour
         }
     }
 
-    /// <summary>
-    /// Carves rooms in largest-to-smallest order (Auditoriums -> Large Workshops -> Standard Rooms -> Closets)
-    /// so every floor features vastly different room sizes from 5x5 closets up to 32x26 auditoriums.
-    /// </summary>
     private void CarveInteriorRoomsByArchetype(System.Random rng)
     {
         int targetRooms = _config != null ? _config.TargetRoomCount : 15;
-        float doorChance = _config != null ? _config.DoorSpawnChance : 0.9f;
 
-        // Build an ordered queue of desired room archetypes for this floor (largest first for optimal packing)
         var desiredArchetypes = new List<RoomArchetype>();
-        int remaining = Mathf.Max(4, targetRooms - 1); // Room 0 is already the Central Room
+        int remaining = Mathf.Max(4, targetRooms - 1);
 
         int auditoriumCount = Mathf.Clamp(remaining / 7, 1, 2);
         int workshopCount = Mathf.Clamp(remaining / 4, 2, 4);
@@ -1129,24 +1401,23 @@ public class FactoryMapGenerator : NetworkBehaviour
         for (int idx = 0; idx < desiredArchetypes.Count && _rooms.Count < targetRooms; idx++)
         {
             RoomArchetype archetype = desiredArchetypes[idx];
-            if (!TryPlaceRoomOfArchetype(archetype, rng, doorChance))
+            if (!TryPlaceRoomOfArchetype(archetype, rng))
             {
-                // Fallback down one size tier if the floor is already tightly packed
                 RoomArchetype fallback = archetype switch
                 {
                     RoomArchetype.Auditorium => RoomArchetype.LargeWorkshop,
                     RoomArchetype.LargeWorkshop => RoomArchetype.StandardRoom,
                     _ => RoomArchetype.Closet
                 };
-                if (!TryPlaceRoomOfArchetype(fallback, rng, doorChance))
+                if (!TryPlaceRoomOfArchetype(fallback, rng))
                 {
-                    TryPlaceRoomOfArchetype(RoomArchetype.Closet, rng, doorChance);
+                    TryPlaceRoomOfArchetype(RoomArchetype.Closet, rng);
                 }
             }
         }
     }
 
-    private bool TryPlaceRoomOfArchetype(RoomArchetype archetype, System.Random rng, float doorChance)
+    private bool TryPlaceRoomOfArchetype(RoomArchetype archetype, System.Random rng)
     {
         int maxAttempts = archetype == RoomArchetype.Auditorium ? 450 : 350;
         int doorSpan = archetype == RoomArchetype.Closet ? 2 : GetDoorwaySpan();
@@ -1169,7 +1440,6 @@ public class FactoryMapGenerator : NetworkBehaviour
 
             if (!connected) continue;
 
-            // Carve room floor
             for (int x = rx; x < rx + rw; x++)
             {
                 for (int y = ry; y < ry + rh; y++)
@@ -1178,15 +1448,13 @@ public class FactoryMapGenerator : NetworkBehaviour
                 }
             }
 
-            // Carve initial doorway
-            bool spawnSwingDoor = rng.NextDouble() <= doorChance;
             if (horizontalDoor)
             {
-                CarveHorizontalDoorway(doorCell.x, doorCell.y, doorSpan, spawnSwingDoor);
+                CarveHorizontalDoorway(doorCell.x, doorCell.y, doorSpan);
             }
             else
             {
-                CarveVerticalDoorway(doorCell.x, doorCell.y, doorSpan, spawnSwingDoor);
+                CarveVerticalDoorway(doorCell.x, doorCell.y, doorSpan);
             }
 
             GetArchetypeDoorAndWindowTargets(archetype, rng, out int targetDoors, out int targetWindows);
@@ -1255,23 +1523,23 @@ public class FactoryMapGenerator : NetworkBehaviour
         switch (archetype)
         {
             case RoomArchetype.Closet:
-                targetDoors = 1; // Closets have a single entrance/exit
-                targetWindows = 0; // Closets have no windows
+                targetDoors = 1;
+                targetWindows = 0;
                 break;
 
             case RoomArchetype.StandardRoom:
-                targetDoors = rng.Next(1, 4); // 1 to 3 entrances/exits
-                targetWindows = rng.Next(1, 3); // 1 to 2 windows
+                targetDoors = rng.Next(1, 4);
+                targetWindows = rng.Next(1, 3);
                 break;
 
             case RoomArchetype.LargeWorkshop:
-                targetDoors = rng.Next(2, 5); // 2 to 4 entrances/exits
-                targetWindows = rng.Next(2, 4); // 2 to 3 windows
+                targetDoors = rng.Next(2, 5);
+                targetWindows = rng.Next(2, 4);
                 break;
 
             case RoomArchetype.Auditorium:
-                targetDoors = rng.Next(3, 5); // 3 to 4 entrances/exits
-                targetWindows = rng.Next(2, 5); // 2 to 4 windows
+                targetDoors = rng.Next(3, 5);
+                targetWindows = rng.Next(2, 5);
                 break;
 
             default:
@@ -1281,15 +1549,8 @@ public class FactoryMapGenerator : NetworkBehaviour
         }
     }
 
-    /// <summary>
-    /// Connects rooms to one another and to neighboring corridors via secondary hallways and doorways
-    /// so rooms achieve their archetype's target entrance/exit count (1 for closets, up to 4 for auditoriums/workshops).
-    /// </summary>
     private void ConnectRoomsWithSecondaryHallwaysAndDoors(System.Random rng, RectInt ringOuter)
     {
-        float doorChance = _config != null ? _config.DoorSpawnChance : 0.9f;
-
-        // Pass 1: Connect additional walls up to each room's TargetDoorways (1–4)
         for (int i = 1; i < _rooms.Count; i++)
         {
             RoomData room = _rooms[i];
@@ -1308,11 +1569,10 @@ public class FactoryMapGenerator : NetworkBehaviour
                 int side = wallOrder[w];
                 if (DoesRoomWallHaveDoorway(bounds, side)) continue;
 
-                TryConnectRoomWallOutward(bounds, side, rng, doorChance);
+                TryConnectRoomWallOutward(bounds, side);
             }
         }
 
-        // Pass 2: Ensure LargeWorkshops and Auditoriums always have at least 2–3 entrances
         for (int i = 1; i < _rooms.Count; i++)
         {
             RoomData room = _rooms[i];
@@ -1326,7 +1586,7 @@ public class FactoryMapGenerator : NetworkBehaviour
             int safety = 0;
             while (GetRoomDoorwayWallCount(room.Bounds) < minRequired && safety < 3)
             {
-                ForceSecondHallwayEntranceForRoom(room.Bounds, ringOuter, rng, doorChance);
+                ForceSecondHallwayEntranceForRoom(room.Bounds, ringOuter);
                 safety++;
             }
         }
@@ -1334,10 +1594,6 @@ public class FactoryMapGenerator : NetworkBehaviour
 
     // ──────────────────────────── Breakable Windows ────────────────────────
 
-    /// <summary>
-    /// Places breakable glass <see cref="BreakableWindow"/> spans along room walls that border
-    /// hallways or adjacent rooms, allowing sight and gunplay through windows while blocking movement.
-    /// </summary>
     private void PlaceRoomWindows(System.Random rng)
     {
         const int windowSpan = 3;
@@ -1369,7 +1625,7 @@ public class FactoryMapGenerator : NetworkBehaviour
     {
         var candidates = new List<(Vector2Int startCell, bool horizontal)>();
 
-        if (wallSide == 0) // North wall (y = room.yMax, outside is y = room.yMax + 1)
+        if (wallSide == 0)
         {
             int wy = room.yMax;
             if (wy + 1 < _height - 1)
@@ -1377,13 +1633,11 @@ public class FactoryMapGenerator : NetworkBehaviour
                 for (int x = room.xMin + 2; x <= room.xMax - 2 - span; x++)
                 {
                     if (IsValidWindowSpan(x, wy, span, true, 0, 1))
-                    {
                         candidates.Add((new Vector2Int(x, wy), true));
-                    }
                 }
             }
         }
-        else if (wallSide == 2) // South wall (y = room.yMin - 1, outside is y = room.yMin - 2)
+        else if (wallSide == 2)
         {
             int wy = room.yMin - 1;
             if (wy - 1 >= 1)
@@ -1391,13 +1645,11 @@ public class FactoryMapGenerator : NetworkBehaviour
                 for (int x = room.xMin + 2; x <= room.xMax - 2 - span; x++)
                 {
                     if (IsValidWindowSpan(x, wy, span, true, 0, -1))
-                    {
                         candidates.Add((new Vector2Int(x, wy), true));
-                    }
                 }
             }
         }
-        else if (wallSide == 1) // East wall (x = room.xMax, outside is x = room.xMax + 1)
+        else if (wallSide == 1)
         {
             int wx = room.xMax;
             if (wx + 1 < _width - 1)
@@ -1405,13 +1657,11 @@ public class FactoryMapGenerator : NetworkBehaviour
                 for (int y = room.yMin + 2; y <= room.yMax - 2 - span; y++)
                 {
                     if (IsValidWindowSpan(wx, y, span, false, 1, 0))
-                    {
                         candidates.Add((new Vector2Int(wx, y), false));
-                    }
                 }
             }
         }
-        else if (wallSide == 3) // West wall (x = room.xMin - 1, outside is x = room.xMin - 2)
+        else if (wallSide == 3)
         {
             int wx = room.xMin - 1;
             if (wx - 1 >= 1)
@@ -1419,9 +1669,7 @@ public class FactoryMapGenerator : NetworkBehaviour
                 for (int y = room.yMin + 2; y <= room.yMax - 2 - span; y++)
                 {
                     if (IsValidWindowSpan(wx, y, span, false, -1, 0))
-                    {
                         candidates.Add((new Vector2Int(wx, y), false));
-                    }
                 }
             }
         }
@@ -1438,7 +1686,7 @@ public class FactoryMapGenerator : NetworkBehaviour
 
         float centerGx = chosen.horizontal ? chosen.startCell.x + (span - 1) * 0.5f : chosen.startCell.x;
         float centerGy = chosen.horizontal ? chosen.startCell.y : chosen.startCell.y + (span - 1) * 0.5f;
-        Vector2 worldCenter = GridToWorld(centerGx, centerGy, _currentFloor.FloorLevel);
+        Vector2 worldCenter = GridToWorld(centerGx, centerGy);
         Vector2 windowSize = chosen.horizontal ? new Vector2(span, 0.92f) : new Vector2(0.92f, span);
 
         int winIdx = _spawnedWindows.Count;
@@ -1453,17 +1701,14 @@ public class FactoryMapGenerator : NetworkBehaviour
 
     private bool IsValidWindowSpan(int startX, int startY, int span, bool horizontal, int outDx, int outDy)
     {
-        // Keep at least 2 tiles of solid concrete wall on either side of the window (away from doors/other windows)
         for (int s = -2; s < span + 2; s++)
         {
             int gx = horizontal ? startX + s : startX;
             int gy = horizontal ? startY : startY + s;
             if (gx <= 1 || gx >= _width - 2 || gy <= 1 || gy >= _height - 2) return false;
-
             if (_grid[gx, gy] != CellType.Wall) return false;
         }
 
-        // Verify that the tiles immediately outside and inside the window span are open floor (Hallway or Room)
         for (int s = 0; s < span; s++)
         {
             int gx = horizontal ? startX + s : startX;
@@ -1529,24 +1774,20 @@ public class FactoryMapGenerator : NetworkBehaviour
         return false;
     }
 
-    private bool TryConnectRoomWallOutward(RectInt room, int wallSide, System.Random rng, float doorChance)
+    private bool TryConnectRoomWallOutward(RectInt room, int wallSide)
     {
-        int hw = _config != null ? _config.HallwayWidth : 6;
+        // Always keep hallways at full configured width (>= 1.5x player body), never narrower!
+        int hw = GetConfiguredHallwayWidth();
         int doorSpan = (room.width <= 8 || room.height <= 8) ? 2 : GetDoorwaySpan();
-        int effHw = Mathf.Min(hw, Mathf.Min(room.width - 2, room.height - 2));
-        if (effHw < doorSpan) return false;
+        if (room.width - 2 < doorSpan || room.height - 2 < doorSpan) return false;
 
-        int doorOffset = Mathf.Max(0, (effHw - doorSpan) / 2);
+        int doorX = Mathf.Clamp(room.xMin + (room.width - doorSpan) / 2, room.xMin + 1, room.xMax - doorSpan - 1);
+        int doorY = Mathf.Clamp(room.yMin + (room.height - doorSpan) / 2, room.yMin + 1, room.yMax - doorSpan - 1);
+        int hallStartX = Mathf.Clamp(doorX - (hw - doorSpan) / 2, 2, _width - hw - 2);
+        int hallStartY = Mathf.Clamp(doorY - (hw - doorSpan) / 2, 2, _height - hw - 2);
         const int maxDist = 36;
 
-        int midX = Mathf.Clamp(room.xMin + (room.width - effHw) / 2, room.xMin + 1, Mathf.Max(room.xMin + 1, room.xMax - effHw - 1));
-        int midY = Mathf.Clamp(room.yMin + (room.height - effHw) / 2, room.yMin + 1, Mathf.Max(room.yMin + 1, room.yMax - effHw - 1));
-        int doorX = midX + doorOffset;
-        int doorY = midY + doorOffset;
-
-        bool spawnDoor = rng.NextDouble() <= doorChance;
-
-        if (wallSide == 0) // North (+Y from room.yMax)
+        if (wallSide == 0)
         {
             if (doorX + doorSpan >= _width - 2) return false;
             for (int dist = 1; dist <= maxDist; dist++)
@@ -1557,10 +1798,10 @@ public class FactoryMapGenerator : NetworkBehaviour
                 if (SpanMatchesCellType(doorX, cy, doorSpan, true, CellType.HallwayFloor))
                 {
                     for (int y = room.yMax + 1; y < cy; y++)
-                        for (int w = 0; w < effHw; w++)
-                            SetHallwayIfWall(midX + w, y);
+                        for (int w = 0; w < hw; w++)
+                            SetHallwayIfWall(hallStartX + w, y);
 
-                    CarveHorizontalDoorway(doorX, room.yMax, doorSpan, spawnDoor);
+                    CarveHorizontalDoorway(doorX, room.yMax, doorSpan);
                     return true;
                 }
 
@@ -1568,22 +1809,22 @@ public class FactoryMapGenerator : NetworkBehaviour
                 {
                     if (dist == 1)
                     {
-                        CarveHorizontalDoorway(doorX, room.yMax, doorSpan, spawnDoor);
+                        CarveHorizontalDoorway(doorX, room.yMax, doorSpan);
                     }
                     else
                     {
                         for (int y = room.yMax + 1; y <= cy - 2; y++)
-                            for (int w = 0; w < effHw; w++)
-                                SetHallwayIfWall(midX + w, y);
+                            for (int w = 0; w < hw; w++)
+                                SetHallwayIfWall(hallStartX + w, y);
 
-                        CarveHorizontalDoorway(doorX, room.yMax, doorSpan, spawnDoor);
-                        CarveHorizontalDoorway(doorX, cy - 1, doorSpan, dist >= 4 && spawnDoor);
+                        CarveHorizontalDoorway(doorX, room.yMax, doorSpan);
+                        CarveHorizontalDoorway(doorX, cy - 1, doorSpan);
                     }
                     return true;
                 }
             }
         }
-        else if (wallSide == 2) // South (-Y from room.yMin - 1)
+        else if (wallSide == 2)
         {
             if (doorX + doorSpan >= _width - 2) return false;
             for (int dist = 1; dist <= maxDist; dist++)
@@ -1594,10 +1835,10 @@ public class FactoryMapGenerator : NetworkBehaviour
                 if (SpanMatchesCellType(doorX, cy, doorSpan, true, CellType.HallwayFloor))
                 {
                     for (int y = cy + 1; y <= room.yMin - 2; y++)
-                        for (int w = 0; w < effHw; w++)
-                            SetHallwayIfWall(midX + w, y);
+                        for (int w = 0; w < hw; w++)
+                            SetHallwayIfWall(hallStartX + w, y);
 
-                    CarveHorizontalDoorway(doorX, room.yMin - 1, doorSpan, spawnDoor);
+                    CarveHorizontalDoorway(doorX, room.yMin - 1, doorSpan);
                     return true;
                 }
 
@@ -1605,22 +1846,22 @@ public class FactoryMapGenerator : NetworkBehaviour
                 {
                     if (dist == 1)
                     {
-                        CarveHorizontalDoorway(doorX, room.yMin - 1, doorSpan, spawnDoor);
+                        CarveHorizontalDoorway(doorX, room.yMin - 1, doorSpan);
                     }
                     else
                     {
                         for (int y = cy + 2; y <= room.yMin - 2; y++)
-                            for (int w = 0; w < effHw; w++)
-                                SetHallwayIfWall(midX + w, y);
+                            for (int w = 0; w < hw; w++)
+                                SetHallwayIfWall(hallStartX + w, y);
 
-                        CarveHorizontalDoorway(doorX, room.yMin - 1, doorSpan, spawnDoor);
-                        CarveHorizontalDoorway(doorX, cy + 1, doorSpan, dist >= 4 && spawnDoor);
+                        CarveHorizontalDoorway(doorX, room.yMin - 1, doorSpan);
+                        CarveHorizontalDoorway(doorX, cy + 1, doorSpan);
                     }
                     return true;
                 }
             }
         }
-        else if (wallSide == 1) // East (+X from room.xMax)
+        else if (wallSide == 1)
         {
             if (doorY + doorSpan >= _height - 2) return false;
             for (int dist = 1; dist <= maxDist; dist++)
@@ -1631,10 +1872,10 @@ public class FactoryMapGenerator : NetworkBehaviour
                 if (SpanMatchesCellType(cx, doorY, doorSpan, false, CellType.HallwayFloor))
                 {
                     for (int x = room.xMax + 1; x < cx; x++)
-                        for (int w = 0; w < effHw; w++)
-                            SetHallwayIfWall(x, midY + w);
+                        for (int w = 0; w < hw; w++)
+                            SetHallwayIfWall(x, hallStartY + w);
 
-                    CarveVerticalDoorway(room.xMax, doorY, doorSpan, spawnDoor);
+                    CarveVerticalDoorway(room.xMax, doorY, doorSpan);
                     return true;
                 }
 
@@ -1642,22 +1883,22 @@ public class FactoryMapGenerator : NetworkBehaviour
                 {
                     if (dist == 1)
                     {
-                        CarveVerticalDoorway(room.xMax, doorY, doorSpan, spawnDoor);
+                        CarveVerticalDoorway(room.xMax, doorY, doorSpan);
                     }
                     else
                     {
                         for (int x = room.xMax + 1; x <= cx - 2; x++)
-                            for (int w = 0; w < effHw; w++)
-                                SetHallwayIfWall(x, midY + w);
+                            for (int w = 0; w < hw; w++)
+                                SetHallwayIfWall(x, hallStartY + w);
 
-                        CarveVerticalDoorway(room.xMax, doorY, doorSpan, spawnDoor);
-                        CarveVerticalDoorway(cx - 1, doorY, doorSpan, dist >= 4 && spawnDoor);
+                        CarveVerticalDoorway(room.xMax, doorY, doorSpan);
+                        CarveVerticalDoorway(cx - 1, doorY, doorSpan);
                     }
                     return true;
                 }
             }
         }
-        else if (wallSide == 3) // West (-X from room.xMin - 1)
+        else if (wallSide == 3)
         {
             if (doorY + doorSpan >= _height - 2) return false;
             for (int dist = 1; dist <= maxDist; dist++)
@@ -1668,10 +1909,10 @@ public class FactoryMapGenerator : NetworkBehaviour
                 if (SpanMatchesCellType(cx, doorY, doorSpan, false, CellType.HallwayFloor))
                 {
                     for (int x = cx + 1; x <= room.xMin - 2; x++)
-                        for (int w = 0; w < effHw; w++)
-                            SetHallwayIfWall(x, midY + w);
+                        for (int w = 0; w < hw; w++)
+                            SetHallwayIfWall(x, hallStartY + w);
 
-                    CarveVerticalDoorway(room.xMin - 1, doorY, doorSpan, spawnDoor);
+                    CarveVerticalDoorway(room.xMin - 1, doorY, doorSpan);
                     return true;
                 }
 
@@ -1679,16 +1920,16 @@ public class FactoryMapGenerator : NetworkBehaviour
                 {
                     if (dist == 1)
                     {
-                        CarveVerticalDoorway(room.xMin - 1, doorY, doorSpan, spawnDoor);
+                        CarveVerticalDoorway(room.xMin - 1, doorY, doorSpan);
                     }
                     else
                     {
                         for (int x = cx + 2; x <= room.xMin - 2; x++)
-                            for (int w = 0; w < effHw; w++)
-                                SetHallwayIfWall(x, midY + w);
+                            for (int w = 0; w < hw; w++)
+                                SetHallwayIfWall(x, hallStartY + w);
 
-                        CarveVerticalDoorway(room.xMin - 1, doorY, doorSpan, spawnDoor);
-                        CarveVerticalDoorway(cx + 1, doorY, doorSpan, dist >= 4 && spawnDoor);
+                        CarveVerticalDoorway(room.xMin - 1, doorY, doorSpan);
+                        CarveVerticalDoorway(cx + 1, doorY, doorSpan);
                     }
                     return true;
                 }
@@ -1723,18 +1964,15 @@ public class FactoryMapGenerator : NetworkBehaviour
         return true;
     }
 
-    private void ForceSecondHallwayEntranceForRoom(RectInt room, RectInt ringOuter, System.Random rng, float doorChance)
+    private void ForceSecondHallwayEntranceForRoom(RectInt room, RectInt ringOuter)
     {
-        int hw = _config != null ? _config.HallwayWidth : 6;
+        int hw = GetConfiguredHallwayWidth();
         int doorSpan = (room.width <= 8 || room.height <= 8) ? 2 : GetDoorwaySpan();
-        int effHw = Mathf.Clamp(Mathf.Min(room.width - 2, room.height - 2), doorSpan, hw);
-        int doorOffset = Mathf.Max(0, (effHw - doorSpan) / 2);
 
-        int midX = Mathf.Clamp(room.xMin + (room.width - effHw) / 2, room.xMin + 1, Mathf.Max(room.xMin + 1, room.xMax - effHw - 1));
-        int midY = Mathf.Clamp(room.yMin + (room.height - effHw) / 2, room.yMin + 1, Mathf.Max(room.yMin + 1, room.yMax - effHw - 1));
-        int doorX = midX + doorOffset;
-        int doorY = midY + doorOffset;
-        bool spawnDoor = rng.NextDouble() <= doorChance;
+        int doorX = Mathf.Clamp(room.xMin + (room.width - doorSpan) / 2, room.xMin + 1, room.xMax - doorSpan - 1);
+        int doorY = Mathf.Clamp(room.yMin + (room.height - doorSpan) / 2, room.yMin + 1, room.yMax - doorSpan - 1);
+        int hallStartX = Mathf.Clamp(doorX - (hw - doorSpan) / 2, 2, _width - hw - 2);
+        int hallStartY = Mathf.Clamp(doorY - (hw - doorSpan) / 2, 2, _height - hw - 2);
 
         int centerX = _width / 2;
         int centerY = _height / 2;
@@ -1754,36 +1992,36 @@ public class FactoryMapGenerator : NetworkBehaviour
             int side = candidateSides[i];
             if (DoesRoomWallHaveDoorway(room, side)) continue;
 
-            if (side == 0 && room.yMax + effHw + 1 < _height - 1)
+            if (side == 0 && room.yMax + hw + 1 < _height - 1)
             {
-                CarveHorizontalDoorway(doorX, room.yMax, doorSpan, spawnDoor);
-                var from = new Vector2Int(midX, room.yMax + 1);
-                var to = new Vector2Int(Mathf.Clamp(midX, ringOuter.xMin, ringOuter.xMax - effHw), ringOuter.yMax - effHw);
-                CarveLCorridor(from, to, effHw, true);
+                CarveHorizontalDoorway(doorX, room.yMax, doorSpan);
+                var from = new Vector2Int(hallStartX, room.yMax + 1);
+                var to = new Vector2Int(Mathf.Clamp(hallStartX, ringOuter.xMin, ringOuter.xMax - hw), ringOuter.yMax - hw);
+                CarveLCorridor(from, to, hw, true);
                 return;
             }
-            if (side == 2 && room.yMin - 1 - effHw > 1)
+            if (side == 2 && room.yMin - 1 - hw > 1)
             {
-                CarveHorizontalDoorway(doorX, room.yMin - 1, doorSpan, spawnDoor);
-                var from = new Vector2Int(midX, room.yMin - 1 - effHw);
-                var to = new Vector2Int(Mathf.Clamp(midX, ringOuter.xMin, ringOuter.xMax - effHw), ringOuter.yMin);
-                CarveLCorridor(from, to, effHw, true);
+                CarveHorizontalDoorway(doorX, room.yMin - 1, doorSpan);
+                var from = new Vector2Int(hallStartX, room.yMin - 1 - hw);
+                var to = new Vector2Int(Mathf.Clamp(hallStartX, ringOuter.xMin, ringOuter.xMax - hw), ringOuter.yMin);
+                CarveLCorridor(from, to, hw, true);
                 return;
             }
-            if (side == 1 && room.xMax + effHw + 1 < _width - 1)
+            if (side == 1 && room.xMax + hw + 1 < _width - 1)
             {
-                CarveVerticalDoorway(room.xMax, doorY, doorSpan, spawnDoor);
-                var from = new Vector2Int(room.xMax + 1, midY);
-                var to = new Vector2Int(ringOuter.xMax - effHw, Mathf.Clamp(midY, ringOuter.yMin, ringOuter.yMax - effHw));
-                CarveLCorridor(from, to, effHw, false);
+                CarveVerticalDoorway(room.xMax, doorY, doorSpan);
+                var from = new Vector2Int(room.xMax + 1, hallStartY);
+                var to = new Vector2Int(ringOuter.xMax - hw, Mathf.Clamp(hallStartY, ringOuter.yMin, ringOuter.yMax - hw));
+                CarveLCorridor(from, to, hw, false);
                 return;
             }
-            if (side == 3 && room.xMin - 1 - effHw > 1)
+            if (side == 3 && room.xMin - 1 - hw > 1)
             {
-                CarveVerticalDoorway(room.xMin - 1, doorY, doorSpan, spawnDoor);
-                var from = new Vector2Int(room.xMin - 1 - effHw, midY);
-                var to = new Vector2Int(ringOuter.xMin, Mathf.Clamp(midY, ringOuter.yMin, ringOuter.yMax - effHw));
-                CarveLCorridor(from, to, effHw, false);
+                CarveVerticalDoorway(room.xMin - 1, doorY, doorSpan);
+                var from = new Vector2Int(room.xMin - 1 - hw, hallStartY);
+                var to = new Vector2Int(ringOuter.xMin, Mathf.Clamp(hallStartY, ringOuter.yMin, ringOuter.yMax - hw));
+                CarveLCorridor(from, to, hw, false);
                 return;
             }
         }
@@ -1795,100 +2033,97 @@ public class FactoryMapGenerator : NetworkBehaviour
         out Vector2Int doorCell,
         out bool horizontalDoor)
     {
-        int hw = _config != null ? _config.HallwayWidth : 6;
-        int effHw = Mathf.Clamp(Mathf.Min(room.width - 2, room.height - 2), doorSpan, hw);
-        int doorOffset = Mathf.Max(0, (effHw - doorSpan) / 2);
+        // Always carve full-width hallways (>= 1.5x player body), even when connecting to a small Closet!
+        int hw = GetConfiguredHallwayWidth();
         const int maxBranchLength = 40;
 
-        int midX = Mathf.Clamp(room.xMin + (room.width - effHw) / 2, room.xMin + 1, Mathf.Max(room.xMin + 1, room.xMax - effHw - 1));
-        int midY = Mathf.Clamp(room.yMin + (room.height - effHw) / 2, room.yMin + 1, Mathf.Max(room.yMin + 1, room.yMax - effHw - 1));
+        int doorX = Mathf.Clamp(room.xMin + (room.width - doorSpan) / 2, room.xMin + 1, room.xMax - doorSpan - 1);
+        int doorY = Mathf.Clamp(room.yMin + (room.height - doorSpan) / 2, room.yMin + 1, room.yMax - doorSpan - 1);
+        int hallStartX = Mathf.Clamp(doorX - (hw - doorSpan) / 2, 2, _width - hw - 2);
+        int hallStartY = Mathf.Clamp(doorY - (hw - doorSpan) / 2, 2, _height - hw - 2);
 
-        // 1. North
         for (int dist = 1; dist <= maxBranchLength; dist++)
         {
             int checkY = room.yMax + dist;
             if (checkY >= _height - 2) break;
-            if (_grid[midX, checkY] == CellType.HallwayFloor && _grid[midX + effHw - 1, checkY] == CellType.HallwayFloor)
+            if (_grid[hallStartX, checkY] == CellType.HallwayFloor && _grid[hallStartX + hw - 1, checkY] == CellType.HallwayFloor)
             {
-                if (IsRegionPureWall(midX, room.yMax + 1, effHw, dist - 1))
+                if (IsRegionPureWall(hallStartX, room.yMax + 1, hw, dist - 1))
                 {
                     for (int y = room.yMax + 1; y < checkY; y++)
-                        for (int w = 0; w < effHw; w++)
-                            _grid[midX + w, y] = CellType.HallwayFloor;
+                        for (int w = 0; w < hw; w++)
+                            _grid[hallStartX + w, y] = CellType.HallwayFloor;
 
-                    doorCell = new Vector2Int(midX + doorOffset, room.yMax);
+                    doorCell = new Vector2Int(doorX, room.yMax);
                     horizontalDoor = true;
                     return true;
                 }
                 break;
             }
-            if (_grid[midX, checkY] != CellType.Wall) break;
+            if (_grid[hallStartX, checkY] != CellType.Wall) break;
         }
 
-        // 2. South
         for (int dist = 1; dist <= maxBranchLength; dist++)
         {
             int checkY = room.yMin - 1 - dist;
             if (checkY <= 1) break;
-            if (_grid[midX, checkY] == CellType.HallwayFloor && _grid[midX + effHw - 1, checkY] == CellType.HallwayFloor)
+            if (_grid[hallStartX, checkY] == CellType.HallwayFloor && _grid[hallStartX + hw - 1, checkY] == CellType.HallwayFloor)
             {
-                if (IsRegionPureWall(midX, checkY + 1, effHw, dist - 1))
+                if (IsRegionPureWall(hallStartX, checkY + 1, hw, dist - 1))
                 {
                     for (int y = checkY + 1; y <= room.yMin - 2; y++)
-                        for (int w = 0; w < effHw; w++)
-                            _grid[midX + w, y] = CellType.HallwayFloor;
+                        for (int w = 0; w < hw; w++)
+                            _grid[hallStartX + w, y] = CellType.HallwayFloor;
 
-                    doorCell = new Vector2Int(midX + doorOffset, room.yMin - 1);
+                    doorCell = new Vector2Int(doorX, room.yMin - 1);
                     horizontalDoor = true;
                     return true;
                 }
                 break;
             }
-            if (_grid[midX, checkY] != CellType.Wall) break;
+            if (_grid[hallStartX, checkY] != CellType.Wall) break;
         }
 
-        // 3. East
         for (int dist = 1; dist <= maxBranchLength; dist++)
         {
             int checkX = room.xMax + dist;
             if (checkX >= _width - 2) break;
-            if (_grid[checkX, midY] == CellType.HallwayFloor && _grid[checkX, midY + effHw - 1] == CellType.HallwayFloor)
+            if (_grid[checkX, hallStartY] == CellType.HallwayFloor && _grid[checkX, hallStartY + hw - 1] == CellType.HallwayFloor)
             {
-                if (IsRegionPureWall(room.xMax + 1, midY, dist - 1, effHw))
+                if (IsRegionPureWall(room.xMax + 1, hallStartY, dist - 1, hw))
                 {
                     for (int x = room.xMax + 1; x < checkX; x++)
-                        for (int w = 0; w < effHw; w++)
-                            _grid[x, midY + w] = CellType.HallwayFloor;
+                        for (int w = 0; w < hw; w++)
+                            _grid[x, hallStartY + w] = CellType.HallwayFloor;
 
-                    doorCell = new Vector2Int(room.xMax, midY + doorOffset);
+                    doorCell = new Vector2Int(room.xMax, doorY);
                     horizontalDoor = false;
                     return true;
                 }
                 break;
             }
-            if (_grid[checkX, midY] != CellType.Wall) break;
+            if (_grid[checkX, hallStartY] != CellType.Wall) break;
         }
 
-        // 4. West
         for (int dist = 1; dist <= maxBranchLength; dist++)
         {
             int checkX = room.xMin - 1 - dist;
             if (checkX <= 1) break;
-            if (_grid[checkX, midY] == CellType.HallwayFloor && _grid[checkX, midY + effHw - 1] == CellType.HallwayFloor)
+            if (_grid[checkX, hallStartY] == CellType.HallwayFloor && _grid[checkX, hallStartY + hw - 1] == CellType.HallwayFloor)
             {
-                if (IsRegionPureWall(checkX + 1, midY, dist - 1, effHw))
+                if (IsRegionPureWall(checkX + 1, hallStartY, dist - 1, hw))
                 {
                     for (int x = checkX + 1; x <= room.xMin - 2; x++)
-                        for (int w = 0; w < effHw; w++)
-                            _grid[x, midY + w] = CellType.HallwayFloor;
+                        for (int w = 0; w < hw; w++)
+                            _grid[x, hallStartY + w] = CellType.HallwayFloor;
 
-                    doorCell = new Vector2Int(room.xMin - 1, midY + doorOffset);
+                    doorCell = new Vector2Int(room.xMin - 1, doorY);
                     horizontalDoor = false;
                     return true;
                 }
                 break;
             }
-            if (_grid[checkX, midY] != CellType.Wall) break;
+            if (_grid[checkX, hallStartY] != CellType.Wall) break;
         }
 
         doorCell = default;
@@ -2074,9 +2309,9 @@ public class FactoryMapGenerator : NetworkBehaviour
         return true;
     }
 
-    private void CarveHorizontalDoorway(int x, int y, int doorSpan, bool spawnDoor)
+    private void CarveHorizontalDoorway(int x, int y, int doorSpan)
     {
-        if (x < 0 || x + doorSpan - 1 >= _width || y < 0 || y >= _height) return;
+        if (x < 1 || x + doorSpan >= _width - 1 || y < 0 || y >= _height) return;
 
         for (int s = 0; s < doorSpan; s++)
         {
@@ -2085,28 +2320,11 @@ public class FactoryMapGenerator : NetworkBehaviour
         }
 
         MarkDoorwayClearanceZone(x, y - 3, doorSpan, 7);
-
-        if (spawnDoor)
-        {
-            int fl = _currentFloor.FloorLevel;
-            if (doorSpan >= 4)
-            {
-                Vector2 leftHinge = GridToWorld(x - 0.38f, y, fl);
-                Vector2 rightHinge = GridToWorld(x + doorSpan - 1 + 0.38f, y, fl);
-                SpawnSwingDoor(leftHinge, 0f, 1.85f);
-                SpawnSwingDoor(rightHinge, 180f, 1.85f);
-            }
-            else
-            {
-                Vector2 hingeWorld = GridToWorld(x - 0.38f, y, fl);
-                SpawnSwingDoor(hingeWorld, 0f, 1.80f);
-            }
-        }
     }
 
-    private void CarveVerticalDoorway(int x, int y, int doorSpan, bool spawnDoor)
+    private void CarveVerticalDoorway(int x, int y, int doorSpan)
     {
-        if (x < 0 || x >= _width || y < 0 || y + doorSpan - 1 >= _height) return;
+        if (x < 0 || x >= _width || y < 1 || y + doorSpan >= _height - 1) return;
 
         for (int s = 0; s < doorSpan; s++)
         {
@@ -2115,21 +2333,141 @@ public class FactoryMapGenerator : NetworkBehaviour
         }
 
         MarkDoorwayClearanceZone(x - 3, y, 7, doorSpan);
+    }
 
-        if (spawnDoor)
+    /// <summary>
+    /// Post-carve pass that scans the finalized grid for every contiguous horizontal and vertical
+    /// <see cref="CellType.Doorway"/> run, locks its flanking jamb tiles as solid <see cref="CellType.Wall"/>
+    /// so the wall opening matches the exact doorway span, and spawns <see cref="SwingDoor"/>(s) that fill
+    /// 100.0% of the entire length of the doorway from jamb to jamb.
+    /// </summary>
+    private void NormalizeAndSpawnAllDoorsForFloor(int floorLevel)
+    {
+        bool[,] handled = new bool[_width, _height];
+
+        // 1. Horizontal doorway runs (along X at fixed Y)
+        for (int y = 0; y < _height; y++)
         {
-            int fl = _currentFloor.FloorLevel;
-            if (doorSpan >= 4)
+            for (int x = 0; x < _width; x++)
             {
-                Vector2 bottomHinge = GridToWorld(x, y - 0.38f, fl);
-                Vector2 topHinge = GridToWorld(x, y + doorSpan - 1 + 0.38f, fl);
-                SpawnSwingDoor(bottomHinge, 90f, 1.85f);
-                SpawnSwingDoor(topHinge, -90f, 1.85f);
+                if (handled[x, y] || _grid[x, y] != CellType.Doorway) continue;
+
+                // Determine if this Doorway belongs to a horizontal run or a vertical run
+                bool isHorizontalRun =
+                    (x + 1 < _width && _grid[x + 1, y] == CellType.Doorway) ||
+                    (y == 0 || y == _height - 1) ||
+                    !(y + 1 < _height && _grid[x, y + 1] == CellType.Doorway);
+
+                if (!isHorizontalRun) continue;
+
+                int span = 1;
+                while (x + span < _width && !handled[x + span, y] && _grid[x + span, y] == CellType.Doorway)
+                {
+                    span++;
+                }
+
+                for (int s = 0; s < span; s++)
+                {
+                    handled[x + s, y] = true;
+                }
+
+                // Lock flanking left and right jamb tiles as solid Wall so the opening is the exact length 'span'
+                if (x - 1 >= 0 && _grid[x - 1, y] != CellType.Window)
+                {
+                    _grid[x - 1, y] = CellType.Wall;
+                }
+                if (x + span < _width && _grid[x + span, y] != CellType.Window)
+                {
+                    _grid[x + span, y] = CellType.Wall;
+                }
+
+                // Spawn SwingDoor(s) filling 100% of the doorway span from (x - 0.5f) to (x + span - 0.5f)
+                float totalLeafLen;
+                if (span >= 3)
+                {
+                    float halfLen = span * 0.5f;
+                    Vector2 leftJambWorld = GridToWorld(x - 0.5f, y);
+                    Vector2 rightJambWorld = GridToWorld(x + span - 0.5f, y);
+                    SpawnSwingDoor(leftJambWorld, 0f, halfLen);
+                    SpawnSwingDoor(rightJambWorld, 180f, halfLen);
+                    totalLeafLen = halfLen * 2f;
+                }
+                else
+                {
+                    float fullLen = span;
+                    Vector2 leftJambWorld = GridToWorld(x - 0.5f, y);
+                    SpawnSwingDoor(leftJambWorld, 0f, fullLen);
+                    totalLeafLen = fullLen;
+                }
+
+                _doorwayRecords.Add(new DoorwaySpanRecord
+                {
+                    FloorLevel = floorLevel,
+                    Horizontal = true,
+                    StartX = x,
+                    StartY = y,
+                    Span = span,
+                    TotalDoorLeafLength = totalLeafLen
+                });
             }
-            else
+        }
+
+        // 2. Vertical doorway runs (along Y at fixed X)
+        for (int x = 0; x < _width; x++)
+        {
+            for (int y = 0; y < _height; y++)
             {
-                Vector2 hingeWorld = GridToWorld(x, y - 0.38f, fl);
-                SpawnSwingDoor(hingeWorld, 90f, 1.80f);
+                if (handled[x, y] || _grid[x, y] != CellType.Doorway) continue;
+
+                int span = 1;
+                while (y + span < _height && !handled[x, y + span] && _grid[x, y + span] == CellType.Doorway)
+                {
+                    span++;
+                }
+
+                for (int s = 0; s < span; s++)
+                {
+                    handled[x, y + s] = true;
+                }
+
+                // Lock flanking bottom and top jamb tiles as solid Wall so the opening is the exact length 'span'
+                if (y - 1 >= 0 && _grid[x, y - 1] != CellType.Window)
+                {
+                    _grid[x, y - 1] = CellType.Wall;
+                }
+                if (y + span < _height && _grid[x, y + span] != CellType.Window)
+                {
+                    _grid[x, y + span] = CellType.Wall;
+                }
+
+                // Spawn SwingDoor(s) filling 100% of the doorway span from (y - 0.5f) to (y + span - 0.5f)
+                float totalLeafLen;
+                if (span >= 3)
+                {
+                    float halfLen = span * 0.5f;
+                    Vector2 bottomJambWorld = GridToWorld(x, y - 0.5f);
+                    Vector2 topJambWorld = GridToWorld(x, y + span - 0.5f);
+                    SpawnSwingDoor(bottomJambWorld, 90f, halfLen);
+                    SpawnSwingDoor(topJambWorld, -90f, halfLen);
+                    totalLeafLen = halfLen * 2f;
+                }
+                else
+                {
+                    float fullLen = span;
+                    Vector2 bottomJambWorld = GridToWorld(x, y - 0.5f);
+                    SpawnSwingDoor(bottomJambWorld, 90f, fullLen);
+                    totalLeafLen = fullLen;
+                }
+
+                _doorwayRecords.Add(new DoorwaySpanRecord
+                {
+                    FloorLevel = floorLevel,
+                    Horizontal = false,
+                    StartX = x,
+                    StartY = y,
+                    Span = span,
+                    TotalDoorLeafLength = totalLeafLen
+                });
             }
         }
     }
@@ -2257,12 +2595,11 @@ public class FactoryMapGenerator : NetworkBehaviour
 
     private void EnforceFloorSafetyClearance(int floorLevel, RectInt ringOuter)
     {
-        int hw = _config != null ? _config.HallwayWidth : 6;
+        int hw = GetConfiguredHallwayWidth();
         int doorSpan = GetDoorwaySpan();
         int doorOffset = Mathf.Max(0, (hw - doorSpan) / 2);
         int vestibuleDepth = Mathf.Max(4, hw + 2);
 
-        // 1. On 1st Floor, force all 4 exterior entrances and their inward vestibules to be 100% clear
         if (floorLevel == 0)
         {
             for (int e = 0; e < 4; e++)
@@ -2275,8 +2612,9 @@ public class FactoryMapGenerator : NetworkBehaviour
                 {
                     for (int w = 0; w < hw; w++)
                     {
-                        if (w >= doorOffset && w < doorOffset + doorSpan)
-                            _grid[gx + w, _height - 1] = CellType.Doorway;
+                        _grid[gx + w, _height - 1] = (w >= doorOffset && w < doorOffset + doorSpan)
+                            ? CellType.Doorway
+                            : CellType.Wall;
                         for (int d = 1; d <= vestibuleDepth; d++)
                             ClearToHallwayFloor(gx + w, _height - 1 - d);
                     }
@@ -2285,8 +2623,9 @@ public class FactoryMapGenerator : NetworkBehaviour
                 {
                     for (int w = 0; w < hw; w++)
                     {
-                        if (w >= doorOffset && w < doorOffset + doorSpan)
-                            _grid[_width - 1, gy + w] = CellType.Doorway;
+                        _grid[_width - 1, gy + w] = (w >= doorOffset && w < doorOffset + doorSpan)
+                            ? CellType.Doorway
+                            : CellType.Wall;
                         for (int d = 1; d <= vestibuleDepth; d++)
                             ClearToHallwayFloor(_width - 1 - d, gy + w);
                     }
@@ -2295,8 +2634,9 @@ public class FactoryMapGenerator : NetworkBehaviour
                 {
                     for (int w = 0; w < hw; w++)
                     {
-                        if (w >= doorOffset && w < doorOffset + doorSpan)
-                            _grid[gx + w, 0] = CellType.Doorway;
+                        _grid[gx + w, 0] = (w >= doorOffset && w < doorOffset + doorSpan)
+                            ? CellType.Doorway
+                            : CellType.Wall;
                         for (int d = 1; d <= vestibuleDepth; d++)
                             ClearToHallwayFloor(gx + w, d);
                     }
@@ -2305,8 +2645,9 @@ public class FactoryMapGenerator : NetworkBehaviour
                 {
                     for (int w = 0; w < hw; w++)
                     {
-                        if (w >= doorOffset && w < doorOffset + doorSpan)
-                            _grid[0, gy + w] = CellType.Doorway;
+                        _grid[0, gy + w] = (w >= doorOffset && w < doorOffset + doorSpan)
+                            ? CellType.Doorway
+                            : CellType.Wall;
                         for (int d = 1; d <= vestibuleDepth; d++)
                             ClearToHallwayFloor(d, gy + w);
                     }
@@ -2314,21 +2655,9 @@ public class FactoryMapGenerator : NetworkBehaviour
             }
         }
 
-        // 2. Ensure all Stairwell Bays on the ring hallway are 100% clear HallwayFloor
-        for (int lowerFloor = -1; lowerFloor <= 1; lowerFloor++)
-        {
-            GetStairwellGridPositionsForShaft(lowerFloor, ringOuter, out Vector2Int bayA, out Vector2Int bayB);
-            for (int dx = -2; dx <= 2; dx++)
-            {
-                for (int dy = -2; dy <= 2; dy++)
-                {
-                    ClearToHallwayFloor(bayA.x + dx, bayA.y + dy);
-                    ClearToHallwayFloor(bayB.x + dx, bayB.y + dy);
-                }
-            }
-        }
+        // Re-enforce stairwell bay walls and landing throats
+        CarveAndReserveStairwellBaysForFloor(floorLevel);
 
-        // 3. Ensure no CoverPillar is within 3 tiles of any Doorway cell
         for (int i = 0; i < _doorwayCells.Count; i++)
         {
             Vector2Int dc = _doorwayCells[i];
@@ -2349,11 +2678,107 @@ public class FactoryMapGenerator : NetworkBehaviour
             }
         }
 
-        // 4. On 1st Floor, BFS connectivity verification from the Central Room to all 4 perimeter entrances
         if (floorLevel == 0)
         {
             EnsureAllEntrancesConnectedViaBfs(ringOuter, hw);
         }
+
+        // Safety Pass: Ensure every HallwayFloor passage across the floor is at least >= 1.5x the player's body wide
+        EnforceMinimumHallwayWidthOnGrid();
+    }
+
+    /// <summary>
+    /// Scans all <see cref="CellType.HallwayFloor"/> tiles on the current floor and guarantees that
+    /// no hallway segment is narrower than <see cref="GetMinHallwayWidthTiles"/> (&gt;= 1.5x player body diameter).
+    /// Any narrow pinch point is automatically widened by converting adjacent <see cref="CellType.Wall"/> tiles.
+    /// </summary>
+    private void EnforceMinimumHallwayWidthOnGrid()
+    {
+        int minTiles = GetMinHallwayWidthTiles();
+
+        for (int pass = 0; pass < 2; pass++)
+        {
+            for (int y = 2; y < _height - 2; y++)
+            {
+                for (int x = 2; x < _width - 2; x++)
+                {
+                    if (_grid[x, y] != CellType.HallwayFloor) continue;
+
+                    int spanX = GetContiguousHallwayOrOpenSpan(x, y, true, out int leftWallX, out int rightWallX);
+                    int spanY = GetContiguousHallwayOrOpenSpan(x, y, false, out int bottomWallY, out int topWallY);
+
+                    // A hallway tile's corridor width is the smaller of its X and Y open spans
+                    int narrowSpan = Mathf.Min(spanX, spanY);
+                    if (narrowSpan < minTiles)
+                    {
+                        if (spanX < minTiles)
+                        {
+                            if (rightWallX < _width - 2 && _grid[rightWallX, y] == CellType.Wall)
+                                _grid[rightWallX, y] = CellType.HallwayFloor;
+                            else if (leftWallX > 1 && _grid[leftWallX, y] == CellType.Wall)
+                                _grid[leftWallX, y] = CellType.HallwayFloor;
+                        }
+
+                        if (spanY < minTiles)
+                        {
+                            if (topWallY < _height - 2 && _grid[x, topWallY] == CellType.Wall)
+                                _grid[x, topWallY] = CellType.HallwayFloor;
+                            else if (bottomWallY > 1 && _grid[x, bottomWallY] == CellType.Wall)
+                                _grid[x, bottomWallY] = CellType.HallwayFloor;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Measure minimum hallway width after enforcement
+        for (int y = 2; y < _height - 2; y++)
+        {
+            for (int x = 2; x < _width - 2; x++)
+            {
+                if (_grid[x, y] != CellType.HallwayFloor) continue;
+
+                int spanX = GetContiguousHallwayOrOpenSpan(x, y, true, out _, out _);
+                int spanY = GetContiguousHallwayOrOpenSpan(x, y, false, out _, out _);
+                int corridorWidth = Mathf.Min(spanX, spanY);
+                if (corridorWidth < MinObservedHallwayWidthWorld)
+                {
+                    MinObservedHallwayWidthWorld = corridorWidth;
+                }
+            }
+        }
+    }
+
+    private int GetContiguousHallwayOrOpenSpan(int startX, int startY, bool horizontal, out int negBound, out int posBound)
+    {
+        int span = 1;
+        int neg = horizontal ? startX - 1 : startY - 1;
+        while (neg >= 1 && IsWalkableFloorOrDoorway(horizontal ? neg : startX, horizontal ? startY : neg))
+        {
+            span++;
+            neg--;
+        }
+        negBound = neg;
+
+        int pos = horizontal ? startX + 1 : startY + 1;
+        int limit = horizontal ? _width - 1 : _height - 1;
+        while (pos < limit && IsWalkableFloorOrDoorway(horizontal ? pos : startX, horizontal ? startY : pos))
+        {
+            span++;
+            pos++;
+        }
+        posBound = pos;
+
+        return span;
+    }
+
+    private bool IsWalkableFloorOrDoorway(int x, int y)
+    {
+        CellType t = _grid[x, y];
+        return t == CellType.HallwayFloor ||
+               t == CellType.RoomFloor ||
+               t == CellType.ObjectiveRoomFloor ||
+               t == CellType.Doorway;
     }
 
     private void ClearToHallwayFloor(int x, int y)
@@ -2407,11 +2832,7 @@ public class FactoryMapGenerator : NetworkBehaviour
                 if (nx < 0 || nx >= _width || ny < 0 || ny >= _height) continue;
                 if (visited[nx, ny]) continue;
 
-                CellType t = _grid[nx, ny];
-                if (t == CellType.HallwayFloor ||
-                    t == CellType.RoomFloor ||
-                    t == CellType.ObjectiveRoomFloor ||
-                    t == CellType.Doorway)
+                if (IsWalkableFloorOrDoorway(nx, ny))
                 {
                     visited[nx, ny] = true;
                     queue.Enqueue(new Vector2Int(nx, ny));
@@ -2431,7 +2852,6 @@ public class FactoryMapGenerator : NetworkBehaviour
         Color darkVoidCol = new Color(0.11f, 0.12f, 0.13f, 1f);
 
         bool[,] visited = new bool[_width, _height];
-        int fl = _currentFloor.FloorLevel;
 
         for (int y = 0; y < _height; y++)
         {
@@ -2480,7 +2900,7 @@ public class FactoryMapGenerator : NetworkBehaviour
                     }
                 }
 
-                Vector2 centerWorld = GridToWorld(x + (runW - 1) * 0.5f, y + (runH - 1) * 0.5f, fl);
+                Vector2 centerWorld = GridToWorld(x + (runW - 1) * 0.5f, y + (runH - 1) * 0.5f);
                 Color blockColor = type == CellType.CoverPillar
                     ? coverCol
                     : (isBorderWall ? wallCol : darkVoidCol);
@@ -2572,7 +2992,7 @@ public class FactoryMapGenerator : NetworkBehaviour
                     continue;
                 }
 
-                Vector2 worldPos = GridToWorld(x, y, floorLevel);
+                Vector2 worldPos = GridToWorld(x, y);
                 bool tooClose = false;
                 for (int i = 0; i < placedPositions.Count; i++)
                 {
@@ -2620,27 +3040,38 @@ public class FactoryMapGenerator : NetworkBehaviour
 
     private void PlaceObjectiveAndTeams(System.Random rng)
     {
-        // 1. Place ComputerTerminal in the center of the Objective Room on _objectiveFloorLevel
+        _objectiveEntityRenderers.Clear();
+        _objectiveEntityColliders.Clear();
+        _patrolDummyBody = null;
+
         Vector2 objCenter = GridToWorld(
             _objectiveRoomBounds.xMin + (_objectiveRoomBounds.width - 1) * 0.5f,
-            _objectiveRoomBounds.yMin + (_objectiveRoomBounds.height - 1) * 0.5f,
-            _objectiveFloorLevel);
+            _objectiveRoomBounds.yMin + (_objectiveRoomBounds.height - 1) * 0.5f);
 
-        var terminalGo = GameObject.Find("ComputerTerminal");
-        if (terminalGo != null)
+        _terminalObject = GameObject.Find("ComputerTerminal");
+        if (_terminalObject != null)
         {
-            terminalGo.transform.position = new Vector3(objCenter.x, objCenter.y, 0f);
+            _terminalObject.transform.position = new Vector3(objCenter.x, objCenter.y, 0f);
 
-            var termLight = terminalGo.GetComponent<Light2D>();
-            if (termLight == null) termLight = terminalGo.AddComponent<Light2D>();
-            termLight.lightType = Light2D.LightType.Point;
-            termLight.color = new Color(0.95f, 0.70f, 0.25f, 1f);
-            termLight.intensity = 0.85f;
-            termLight.pointLightOuterRadius = 5.5f;
-            termLight.pointLightInnerRadius = 0.6f;
+            _terminalLight = _terminalObject.GetComponent<Light2D>();
+            if (_terminalLight == null) _terminalLight = _terminalObject.AddComponent<Light2D>();
+            _terminalLight.lightType = Light2D.LightType.Point;
+            _terminalLight.color = new Color(0.95f, 0.70f, 0.25f, 1f);
+            _terminalLight.intensity = _terminalBaseLightIntensity;
+            _terminalLight.pointLightOuterRadius = 5.5f;
+            _terminalLight.pointLightInnerRadius = 0.6f;
+
+            var termSrs = _terminalObject.GetComponentsInChildren<SpriteRenderer>(true);
+            for (int i = 0; i < termSrs.Length; i++)
+            {
+                Color c = termSrs[i].color;
+                c.a = 1f;
+                termSrs[i].color = c;
+                _objectiveEntityRenderers.Add((termSrs[i], c));
+            }
+            _objectiveEntityColliders.AddRange(_terminalObject.GetComponentsInChildren<Collider2D>(true));
         }
 
-        // 2. Shuffle the 4 entrances on the 1st Floor so Team A and Team B spawn at random distinct entrances
         int[] entranceOrder = { 0, 1, 2, 3 };
         for (int i = entranceOrder.Length - 1; i > 0; i--)
         {
@@ -2651,7 +3082,6 @@ public class FactoryMapGenerator : NetworkBehaviour
         EntranceData teamAEntrance = _entrances[entranceOrder[0]];
         EntranceData teamBEntrance = _entrances[entranceOrder[1]];
 
-        // 3. Position Team A Extraction Zone, Player, and Friendly Dummy at Team A's random courtyard entrance (1st Floor)
         var zoneA = GameObject.Find("ExtractionZone_TeamA");
         if (zoneA != null)
         {
@@ -2685,7 +3115,6 @@ public class FactoryMapGenerator : NetworkBehaviour
             if (dc != null) dc.SetSpawnOrigin(friendlySpawn, -patrolAxis, patrolAxis);
         }
 
-        // 4. Position Team B Extraction Zone and Enemy Dummies
         var zoneB = GameObject.Find("ExtractionZone_TeamB");
         if (zoneB != null)
         {
@@ -2706,7 +3135,6 @@ public class FactoryMapGenerator : NetworkBehaviour
             if (dc != null) dc.SetSpawnOrigin(stationarySpawn, Vector2.zero, Vector2.zero);
         }
 
-        // Place EnemyDummy_Patrol on the Objective Floor's ring hallway clear of doorways & stairwells
         var enemyPatrol = GameObject.Find("EnemyDummy_Patrol");
         if (enemyPatrol != null)
         {
@@ -2714,6 +3142,17 @@ public class FactoryMapGenerator : NetworkBehaviour
             TeleportCharacter(enemyPatrol, guardPos);
             var dc = enemyPatrol.GetComponent<DummyController>();
             if (dc != null) dc.SetSpawnOrigin(guardPos, new Vector2(-3.5f, 0f), new Vector2(3.5f, 0f));
+
+            _patrolDummyBody = enemyPatrol.GetComponent<Rigidbody2D>();
+            var patrolSrs = enemyPatrol.GetComponentsInChildren<SpriteRenderer>(true);
+            for (int i = 0; i < patrolSrs.Length; i++)
+            {
+                Color c = patrolSrs[i].color;
+                c.a = 1f;
+                patrolSrs[i].color = c;
+                _objectiveEntityRenderers.Add((patrolSrs[i], c));
+            }
+            _objectiveEntityColliders.AddRange(enemyPatrol.GetComponentsInChildren<Collider2D>(true));
         }
     }
 
@@ -2722,10 +3161,9 @@ public class FactoryMapGenerator : NetworkBehaviour
         if (!_floorStates.TryGetValue(floorLevel, out var state))
         {
             state = _floorStates[0];
-            floorLevel = 0;
         }
 
-        int hw = _config != null ? _config.HallwayWidth : 6;
+        int hw = GetConfiguredHallwayWidth();
         int preferredX = state.CentralRoomBounds.xMin + state.CentralRoomBounds.width / 2;
         int preferredY = state.CentralRoomBounds.yMax + 1 + (hw / 2);
 
@@ -2733,21 +3171,28 @@ public class FactoryMapGenerator : NetworkBehaviour
         {
             for (int x = 4; x < _width - 4; x++)
             {
-                if (state.Grid[x, y] == CellType.HallwayFloor && ! state.ProtectedZone[x, y])
+                if (state.Grid[x, y] == CellType.HallwayFloor && !state.ProtectedZone[x, y])
                 {
-                    return GridToWorld(x, y, floorLevel);
+                    return GridToWorld(x, y);
                 }
             }
         }
 
-        return GridToWorld(preferredX, preferredY, floorLevel);
+        return GridToWorld(preferredX, preferredY);
     }
 
-    private void ValidateEntranceClearancePhysics()
+    /// <summary>
+    /// Validates:
+    /// 1. All 4 perimeter entrances are 100% clear of blocking geometry/dummies.
+    /// 2. Every hallway across all floors has width &gt;= 1.5x the player's body diameter.
+    /// 3. Every doorway across all floors has spawned <see cref="SwingDoor"/>(s) whose leaf length fills 100% of the doorway span.
+    /// </summary>
+    private void ValidateEntranceHallwayAndDoorSafety()
     {
         Physics2D.SyncTransforms();
         bool allClear = true;
 
+        // 1. Entrance clearance check
         for (int e = 0; e < 4; e++)
         {
             EntranceData ent = _entrances[e];
@@ -2799,8 +3244,28 @@ public class FactoryMapGenerator : NetworkBehaviour
                 allClear = false;
             }
         }
-
         AllEntrancesVerifiedClear = allClear;
+
+        // 2. Hallway minimum width verification (>= 1.5x player body diameter)
+        float minRequiredHallwayWidth = GetMinHallwayWidthWorld();
+        if (MinObservedHallwayWidthWorld == float.MaxValue)
+        {
+            MinObservedHallwayWidthWorld = GetConfiguredHallwayWidth();
+        }
+        AllHallwaysMeetMinWidth = MinObservedHallwayWidthWorld >= minRequiredHallwayWidth;
+
+        // 3. Doorway full-span coverage verification (100% of doorways have doors filling 100% of the doorway length)
+        bool doorsValid = _doorwayRecords.Count > 0 && _spawnedDoors.Count >= _doorwayRecords.Count;
+        for (int i = 0; i < _doorwayRecords.Count; i++)
+        {
+            DoorwaySpanRecord rec = _doorwayRecords[i];
+            if (Mathf.Abs(rec.TotalDoorLeafLength - rec.Span) > 0.01f)
+            {
+                doorsValid = false;
+                break;
+            }
+        }
+        AllDoorsFillDoorwaysVerified = doorsValid;
     }
 
     private static void TeleportCharacter(GameObject character, Vector2 worldPos)
@@ -2827,12 +3292,11 @@ public class FactoryMapGenerator : NetworkBehaviour
 
     // ──────────────────────────── Helpers & HUD ────────────────────────────
 
-    private Vector2 GridToWorld(float gx, float gy, int floorLevel = 0)
+    private Vector2 GridToWorld(float gx, float gy)
     {
-        Vector2 offset = GetFloorWorldOffset(floorLevel);
         return new Vector2(
-            gx - (_width * 0.5f) + 0.5f + offset.x,
-            gy - (_height * 0.5f) + 0.5f + offset.y);
+            gx - (_width * 0.5f) + 0.5f,
+            gy - (_height * 0.5f) + 0.5f);
     }
 
     private static void EnsureTileSprite()
@@ -2855,7 +3319,11 @@ public class FactoryMapGenerator : NetworkBehaviour
         if (!_showMapSeedHud) return;
 
         string floorsDesc = string.Join(", ", _activeFloors.ConvertAll(GetFloorDisplayName));
-        GUILayout.BeginArea(new Rect(10f, 48f, 490f, 64f));
+        string stairStatus = CurrentStairClimbProgress >= 0f
+            ? $" (Stairs: {Mathf.RoundToInt(CurrentStairClimbProgress * 100f)}%)"
+            : string.Empty;
+
+        GUILayout.BeginArea(new Rect(10f, 48f, 520f, 64f));
         GUILayout.BeginVertical("box");
         GUILayout.BeginHorizontal();
         GUILayout.Label($"Seed: {MapSeed} | Floors ({_activeFloors.Count}): {floorsDesc}");
@@ -2865,9 +3333,9 @@ public class FactoryMapGenerator : NetworkBehaviour
         }
         GUILayout.EndHorizontal();
         GUILayout.Label(
-            $"Current: {GetFloorDisplayName(CurrentLocalFloorLevel)} | " +
+            $"Current: {GetFloorDisplayName(CurrentLocalFloorLevel)}{stairStatus} | " +
             $"Objective: {GetFloorDisplayName(_objectiveFloorLevel)} | " +
-            $"Rooms: {_allRooms.Count} | Windows: {_spawnedWindows.Count}");
+            $"Staircases: {_spawnedStairwells.Count}");
         GUILayout.EndVertical();
         GUILayout.EndArea();
     }

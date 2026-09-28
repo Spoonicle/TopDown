@@ -41,6 +41,15 @@ public class SwingDoor : MonoBehaviour
     /// <summary>Current swing offset angle in degrees relative to the closed angle (-98 to +98).</summary>
     public float CurrentOffsetAngle => _currentOffsetAngle;
 
+    /// <summary>World length of this door leaf from hinge to tip.</summary>
+    public float DoorLength => _doorLength;
+
+    /// <summary>World position of this door's hinge pivot.</summary>
+    public Vector2 HingeWorldPos => _hingeWorldPos;
+
+    /// <summary>Closed resting angle in degrees.</summary>
+    public float ClosedAngleDeg => _closedAngleDeg;
+
     // ──────────────────────────── Initialization ───────────────────────────
 
     /// <summary>

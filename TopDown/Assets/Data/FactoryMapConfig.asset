@@ -12,24 +12,24 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 5af96784ff78a1b42bc242bdf24bd701, type: 3}
   m_Name: FactoryMapConfig
   m_EditorClassIdentifier: Assembly-CSharp::FactoryMapConfig
-  _buildingWidth: 36
-  _buildingHeight: 36
-  _courtyardMargin: 6
-  _entranceCornerMargin: 6
-  _objectiveRoomSize: 8
-  _targetRoomCount: 9
-  _minRoomSize: 5
-  _maxRoomSize: 8
-  _hallwayWidth: 2
+  _buildingWidth: 108
+  _buildingHeight: 108
+  _courtyardMargin: 14
+  _entranceCornerMargin: 18
+  _objectiveRoomSize: 24
+  _targetRoomCount: 15
+  _minRoomSize: 11
+  _maxRoomSize: 18
+  _hallwayWidth: 6
   _doorSpawnChance: 0.9
-  _minCoverPerRoom: 1
-  _maxCoverPerRoom: 2
+  _minCoverPerRoom: 2
+  _maxCoverPerRoom: 4
   _ambientLightIntensity: 0.08
-  _hallwayLightSpacing: 5
+  _hallwayLightSpacing: 12
   _steadyLightRatio: 0.55
   _flickerLightRatio: 0.35
-  _hallwayLightIntensity: 1.15
-  _hallwayLightRadius: 5.5
+  _hallwayLightIntensity: 1.2
+  _hallwayLightRadius: 13
   _wallColor: {r: 0.36, g: 0.37, b: 0.38, a: 1}
   _coverColor: {r: 0.28, g: 0.29, b: 0.31, a: 1}
   _doorColor: {r: 0.45, g: 0.38, b: 0.32, a: 1}

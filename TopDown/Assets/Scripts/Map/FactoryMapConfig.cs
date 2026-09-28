@@ -13,43 +13,43 @@ public class FactoryMapConfig : ScriptableObject
 
     [Header("Building Dimensions")]
     [Tooltip("Width of the concrete factory building in tiles (1 tile = 1 world unit).")]
-    [Range(24, 64)]
-    [SerializeField] private int _buildingWidth = 36;
+    [Range(24, 160)]
+    [SerializeField] private int _buildingWidth = 108;
 
     [Tooltip("Height of the concrete factory building in tiles (1 tile = 1 world unit).")]
-    [Range(24, 64)]
-    [SerializeField] private int _buildingHeight = 36;
+    [Range(24, 160)]
+    [SerializeField] private int _buildingHeight = 108;
 
     [Tooltip("Width of the exterior courtyard around the factory where teams spawn and extract.")]
-    [Range(5, 16)]
-    [SerializeField] private int _courtyardMargin = 6;
+    [Range(5, 30)]
+    [SerializeField] private int _courtyardMargin = 14;
 
     [Tooltip("Minimum distance in tiles from any building corner for the 4 shifted perimeter entrances.")]
-    [Range(4, 12)]
-    [SerializeField] private int _entranceCornerMargin = 6;
+    [Range(4, 36)]
+    [SerializeField] private int _entranceCornerMargin = 18;
 
     // ───────────────────────────── Rooms & Hallways ─────────────────────────
 
     [Header("Rooms & Hallways")]
     [Tooltip("Width and height in tiles of the central Objective Room.")]
-    [Range(6, 12)]
-    [SerializeField] private int _objectiveRoomSize = 8;
+    [Range(6, 36)]
+    [SerializeField] private int _objectiveRoomSize = 24;
 
-    [Tooltip("Target number of additional interior rooms to carve inside the factory.")]
-    [Range(5, 16)]
-    [SerializeField] private int _targetRoomCount = 9;
+    [Tooltip("Target total number of rooms inside the factory building (including the Objective Room).")]
+    [Range(5, 30)]
+    [SerializeField] private int _targetRoomCount = 15;
 
     [Tooltip("Minimum interior room width/height in tiles.")]
-    [Range(4, 8)]
-    [SerializeField] private int _minRoomSize = 5;
+    [Range(4, 24)]
+    [SerializeField] private int _minRoomSize = 11;
 
     [Tooltip("Maximum interior room width/height in tiles.")]
-    [Range(6, 12)]
-    [SerializeField] private int _maxRoomSize = 8;
+    [Range(6, 36)]
+    [SerializeField] private int _maxRoomSize = 18;
 
     [Tooltip("Width of concrete hallways in tiles.")]
-    [Range(2, 4)]
-    [SerializeField] private int _hallwayWidth = 2;
+    [Range(2, 10)]
+    [SerializeField] private int _hallwayWidth = 6;
 
     // ───────────────────────────── Doors & Cover ────────────────────────────
 
@@ -59,12 +59,12 @@ public class FactoryMapConfig : ScriptableObject
     [SerializeField] private float _doorSpawnChance = 0.9f;
 
     [Tooltip("Minimum number of concrete cover pillars/crates spawned inside each room.")]
-    [Range(0, 4)]
-    [SerializeField] private int _minCoverPerRoom = 1;
+    [Range(0, 8)]
+    [SerializeField] private int _minCoverPerRoom = 2;
 
     [Tooltip("Maximum number of concrete cover pillars/crates spawned inside each room.")]
-    [Range(0, 5)]
-    [SerializeField] private int _maxCoverPerRoom = 2;
+    [Range(0, 10)]
+    [SerializeField] private int _maxCoverPerRoom = 4;
 
     // ───────────────────────────── Lighting & Darkness ──────────────────────
 
@@ -74,8 +74,8 @@ public class FactoryMapConfig : ScriptableObject
     [SerializeField] private float _ambientLightIntensity = 0.08f;
 
     [Tooltip("Spacing in tiles between overhead emergency lights along hallways.")]
-    [Range(3, 10)]
-    [SerializeField] private int _hallwayLightSpacing = 5;
+    [Range(3, 24)]
+    [SerializeField] private int _hallwayLightSpacing = 12;
 
     [Tooltip("Probability (0–1) that a hallway light is steady on (remaining lights flicker or are broken).")]
     [Range(0f, 1f)]
@@ -87,11 +87,11 @@ public class FactoryMapConfig : ScriptableObject
 
     [Tooltip("Base intensity of hallway emergency point lights.")]
     [Range(0.3f, 3f)]
-    [SerializeField] private float _hallwayLightIntensity = 1.15f;
+    [SerializeField] private float _hallwayLightIntensity = 1.2f;
 
     [Tooltip("Outer radius in world units of hallway emergency point lights.")]
-    [Range(2f, 10f)]
-    [SerializeField] private float _hallwayLightRadius = 5.5f;
+    [Range(2f, 24f)]
+    [SerializeField] private float _hallwayLightRadius = 13f;
 
     // ───────────────────────────── Palette Colors ───────────────────────────
 

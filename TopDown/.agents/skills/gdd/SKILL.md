@@ -127,19 +127,28 @@ A single match (approx. 5–10 minutes):
 Modern-day, abandoned industrial factory. Cold, utilitarian architecture — concrete walls, metal catwalks, rusted pipes, broken windows. Set during a moonless night. The factory has been abandoned but still has emergency lighting in some hallways. The atmosphere is oppressive and claustrophobic.
 
 ### Level Structure
-- **Procedurally generated cement factory**: Synced across multiplayer via a single server-authoritative `mapSeed` (`NetworkVariable<int>`). Each match generates a new interior layout of concrete hallways, dark rooms, interior cover (pillars/crates), and **1 Objective Room** containing the `ComputerTerminal`.
-- **4 Perimeter Entrances**: The factory exterior features 4 entrances (one on each of the North, East, South, and West walls), randomly shifted along each wall per seed while maintaining minimum spacing so teams never start fighting immediately at spawn.
-- **Random Entrance Spawns & Extraction**: At round start, each team's spawn and `ExtractionZone` are placed outside a randomly selected entrance (never the same entrance), so teams do not immediately know which entrance the opposing squad used.
+- **Procedurally generated cement factory**: Synced across multiplayer via a single server-authoritative `mapSeed` (`NetworkVariable<int>`). Each match generates a new interior layout of concrete hallways, 15 dark rooms per floor, interior cover (pillars/crates), and **1 Objective Room** containing the `ComputerTerminal`.
+- **Room Size Archetypes & 1–4 Entrances/Exits**: Rooms vary vastly in size and doorway/window counts scale by archetype:
+  - **Closets (`5×5` to `8×8`)**: 1 single doorway, no windows, 0–1 small pillar.
+  - **Standard Rooms (`11×11` to `17×17`)**: 1–3 doorways, 1–2 window spans, 2–3 pillars.
+  - **Large Workshops (`18×18` to `24×24`)**: 2–4 doorways, 2–3 window spans, 3–5 pillars.
+  - **Auditoriums (`26×20` to `32×26`)**: 3–4 doorways, 2–4 window spans, 5–8 pillars.
+- **1 to 3 Floors (`Basement`, `1st Floor`, `2nd Floor`, `3rd Floor`)**:
+  - Valid combinations: `[1st]`, `[Basement, 1st]`, `[1st, 2nd]`, `[Basement, 1st, 2nd]`, or `[1st, 2nd, 3rd]`.
+  - **Strict Mutual Exclusion**: If there is a **3rd Floor**, there is **no Basement**, and vice-versa. The **1st Floor** is always present and holds the 4 exterior perimeter entrances and courtyard extraction zones.
+  - **Walk-On Stairwells (`StairwellZone`)**: Stepping onto an `UP` or `DOWN` stairwell pad transitions the player and camera seamlessly to the matching stairwell on the adjacent floor.
+  - **Multi-Floor Objective**: The 1 Objective Room can spawn on any active floor; `ObjectiveCarrier` routes the extraction guide arrow to the nearest stairwell toward the 1st Floor before pointing to the courtyard `ExtractionZone`.
+- **4 Perimeter Entrances**: The 1st Floor exterior features 4 entrances (North, East, South, West), randomly shifted along each wall per seed while maintaining minimum spacing so teams never start fighting immediately at spawn.
+- **Random Entrance Spawns & Extraction**: At round start, each team's spawn and `ExtractionZone` are placed outside a randomly selected entrance (never the same entrance).
 - **Physics-Pushed Swinging Doors**: Doorways contain physical doors (`SwingDoor`) that swing open when players push against them with either their player body or their equipped weapon barrel (`WeaponVisual`).
-- **Dark Rooms & Flickering Hallway Lights**: Interior rooms are dark; visibility comes from hallway emergency lights (`HallwayLight` — some steady on, some flickering, some off), objective terminal glow, and dynamic 2D muzzle flashes.
-- **1 to 3 stories** (future expansion): Each match can determine floor count (1, 2, or 3 floors) connected by staircases.
-- **Multi-floor rendering**: Fundamentally 2D layer swap — each floor is its own flat layout with subtle visual hints of verticality.
+- **Breakable Glass Windows (`BreakableWindow`)**: Room walls bordering hallways or adjacent rooms feature glass windows that allow sight through, shatter when shot so bullets pass through freely, and always block player movement.
+- **Dark Rooms & Flickering Hallway Lights**: Interior rooms are dark; visibility comes from hallway emergency lights (`HallwayLight` — some steady on, some flickering, some off), stairwell beacons, objective terminal glow, and dynamic 2D muzzle flashes.
 
 ### Environmental Hazards
 - **Darkness itself**: Limited visibility is the primary hazard. Players can only see clearly in lit areas or during muzzle flashes.
 - **Destructible lights** (future): Shooting out hallway lights to create dark zones
 - **Physics doors**: Doors physically swing and can reveal movement when pushed open by a player or gun barrel
-- **Glass windows** (future): Breakable, allowing sight lines and sound propagation
+- **Breakable glass windows**: Shatter on the first gunshot with glass shard particles, opening lines of fire while continuing to block player movement through the window frame
 
 ### Camera
 - **Fixed top-down camera** (orthographic or near-orthographic)

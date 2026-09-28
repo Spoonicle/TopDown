@@ -134,12 +134,18 @@ public class Weapon : MonoBehaviour
         RaycastHit2D hit = default;
         RaycastHit2D[] hits = Physics2D.RaycastAll(barrelPosition, fireDirection, _data.Range, _hitMask);
 
-        // Find the closest valid hit (skipping self and own team, hitting all other teams and walls)
+        // Find the closest valid solid hit (skipping self, own team, and pass-through window frames)
         float closestDist = float.MaxValue;
         foreach (var h in hits)
         {
             if (h.collider == null || h.collider.isTrigger) continue;
             if (h.collider == ignoredCollider) continue;
+
+            if (h.collider.GetComponent<BreakableWindow>() != null ||
+                h.collider.GetComponentInParent<BreakableWindow>() != null)
+            {
+                continue;
+            }
 
             if (shooterTeam != null)
             {
@@ -154,6 +160,18 @@ public class Weapon : MonoBehaviour
             {
                 closestDist = h.distance;
                 hit = h;
+            }
+        }
+
+        // Shatter any intact BreakableWindow along the bullet path before the stopping impact point
+        foreach (var h in hits)
+        {
+            if (h.collider == null || h.distance > closestDist) continue;
+
+            var window = h.collider.GetComponent<BreakableWindow>() ?? h.collider.GetComponentInParent<BreakableWindow>();
+            if (window != null && !window.IsBroken)
+            {
+                window.ShatterFromShot(h.point);
             }
         }
 

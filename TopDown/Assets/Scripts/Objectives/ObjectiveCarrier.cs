@@ -102,7 +102,7 @@ public class ObjectiveCarrier : NetworkBehaviour
             _badgeTransform.rotation = Quaternion.Euler(0f, 0f, 45f);
         }
 
-        // Rotate extraction guide arrow toward the carrier's team extraction zone (only visible to owner)
+        // Rotate extraction guide arrow toward the carrier's team extraction zone (or nearest stairwell toward 1st floor)
         if (_arrowPivot != null)
         {
             bool showArrow = _playerController != null && _playerController.HasInputAuthority;
@@ -113,7 +113,13 @@ public class ObjectiveCarrier : NetworkBehaviour
                 ExtractionZone zone = ExtractionZone.FindZoneForTeam(_teamMember);
                 if (zone != null)
                 {
-                    Vector2 toZone = (Vector2)zone.transform.position - (Vector2)transform.position;
+                    Vector2 targetWorld = zone.transform.position;
+                    if (FactoryMapGenerator.Instance != null)
+                    {
+                        targetWorld = FactoryMapGenerator.Instance.ResolveNavigationTarget(transform.position, targetWorld);
+                    }
+
+                    Vector2 toZone = targetWorld - (Vector2)transform.position;
                     if (toZone.sqrMagnitude > 0.01f)
                     {
                         float angle = Mathf.Atan2(toZone.y, toZone.x) * Mathf.Rad2Deg;

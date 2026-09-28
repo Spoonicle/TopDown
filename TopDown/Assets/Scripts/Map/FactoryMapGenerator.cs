@@ -105,6 +105,14 @@ public class FactoryMapGenerator : NetworkBehaviour
         public float TotalDoorLeafLength;
     }
 
+    private struct DesignatedDoorway
+    {
+        public int StartX;
+        public int StartY;
+        public int Span;
+        public bool IsHorizontal;
+    }
+
     private class FloorGenerationState
     {
         public int FloorLevel;
@@ -115,6 +123,7 @@ public class FactoryMapGenerator : NetworkBehaviour
         public RectInt RingOuterBounds;
         public readonly List<RoomData> Rooms = new List<RoomData>();
         public readonly List<Vector2Int> DoorwayCells = new List<Vector2Int>();
+        public readonly List<DesignatedDoorway> DesignatedDoorways = new List<DesignatedDoorway>();
 
         public readonly List<(SpriteRenderer renderer, Color baseColor)> Renderers = new List<(SpriteRenderer, Color)>();
         public readonly List<HallwayLight> Lights = new List<HallwayLight>();
@@ -1420,7 +1429,7 @@ public class FactoryMapGenerator : NetworkBehaviour
     private bool TryPlaceRoomOfArchetype(RoomArchetype archetype, System.Random rng)
     {
         int maxAttempts = archetype == RoomArchetype.Auditorium ? 450 : 350;
-        int doorSpan = archetype == RoomArchetype.Closet ? 2 : GetDoorwaySpan();
+        int doorSpan = archetype == RoomArchetype.Closet ? 3 : GetDoorwaySpan();
 
         for (int a = 0; a < maxAttempts; a++)
         {
@@ -1778,7 +1787,7 @@ public class FactoryMapGenerator : NetworkBehaviour
     {
         // Always keep hallways at full configured width (>= 1.5x player body), never narrower!
         int hw = GetConfiguredHallwayWidth();
-        int doorSpan = (room.width <= 8 || room.height <= 8) ? 2 : GetDoorwaySpan();
+        int doorSpan = (room.width <= 8 || room.height <= 8) ? 3 : GetDoorwaySpan();
         if (room.width - 2 < doorSpan || room.height - 2 < doorSpan) return false;
 
         int doorX = Mathf.Clamp(room.xMin + (room.width - doorSpan) / 2, room.xMin + 1, room.xMax - doorSpan - 1);
@@ -2319,6 +2328,17 @@ public class FactoryMapGenerator : NetworkBehaviour
             _doorwayCells.Add(new Vector2Int(x + s, y));
         }
 
+        if (_currentFloor != null)
+        {
+            _currentFloor.DesignatedDoorways.Add(new DesignatedDoorway
+            {
+                StartX = x,
+                StartY = y,
+                Span = doorSpan,
+                IsHorizontal = true
+            });
+        }
+
         MarkDoorwayClearanceZone(x, y - 3, doorSpan, 7);
     }
 
@@ -2332,46 +2352,87 @@ public class FactoryMapGenerator : NetworkBehaviour
             _doorwayCells.Add(new Vector2Int(x, y + s));
         }
 
+        if (_currentFloor != null)
+        {
+            _currentFloor.DesignatedDoorways.Add(new DesignatedDoorway
+            {
+                StartX = x,
+                StartY = y,
+                Span = doorSpan,
+                IsHorizontal = false
+            });
+        }
+
         MarkDoorwayClearanceZone(x - 3, y, 7, doorSpan);
     }
 
     /// <summary>
-    /// Post-carve pass that scans the finalized grid for every contiguous horizontal and vertical
-    /// <see cref="CellType.Doorway"/> run, locks its flanking jamb tiles as solid <see cref="CellType.Wall"/>
-    /// so the wall opening matches the exact doorway span, and spawns <see cref="SwingDoor"/>(s) that fill
-    /// 100.0% of the entire length of the doorway from jamb to jamb.
+    /// Post-carve pass that validates every designated doorway, prevents any door from spawning
+    /// inside a solid wall, anchors door hinges flush to solid wall jambs, and scales doors so they
+    /// fill 100.0% of the entire doorway width from jamb to jamb.
     /// </summary>
     private void NormalizeAndSpawnAllDoorsForFloor(int floorLevel)
     {
+        if (_currentFloor == null) return;
+
         bool[,] handled = new bool[_width, _height];
+        var designated = _currentFloor.DesignatedDoorways;
 
-        // 1. Horizontal doorway runs (along X at fixed Y)
-        for (int y = 0; y < _height; y++)
+        for (int i = 0; i < designated.Count; i++)
         {
-            for (int x = 0; x < _width; x++)
+            DesignatedDoorway dd = designated[i];
+            int x = dd.StartX;
+            int y = dd.StartY;
+            int span = dd.Span;
+
+            if (dd.IsHorizontal)
             {
-                if (handled[x, y] || _grid[x, y] != CellType.Doorway) continue;
+                if (x < 1 || x + span >= _width - 1 || y < 0 || y >= _height) continue;
 
-                // Determine if this Doorway belongs to a horizontal run or a vertical run
-                bool isHorizontalRun =
-                    (x + 1 < _width && _grid[x + 1, y] == CellType.Doorway) ||
-                    (y == 0 || y == _height - 1) ||
-                    !(y + 1 < _height && _grid[x, y + 1] == CellType.Doorway);
-
-                if (!isHorizontalRun) continue;
-
-                int span = 1;
-                while (x + span < _width && !handled[x + span, y] && _grid[x + span, y] == CellType.Doorway)
-                {
-                    span++;
-                }
-
+                // Check if any tile in this doorway was already handled by an earlier identical doorway
+                bool alreadyHandled = false;
                 for (int s = 0; s < span; s++)
                 {
-                    handled[x + s, y] = true;
+                    if (handled[x + s, y]) { alreadyHandled = true; break; }
+                }
+                if (alreadyHandled) continue;
+
+                // ── SAFETY CHECK 1: Ensure doorway connects two open walkable spaces (North & South) ──
+                // If y is an outer perimeter wall (y == 0 or y == _height - 1), it opens to the outside courtyard.
+                // Otherwise, both y - 1 and y + 1 must have walkable open space. If either side is solid wall across
+                // the entire span, this doorway leads into a solid wall — DO NOT spawn a door and seal it!
+                bool hasPassageNorth = (y == _height - 1);
+                bool hasPassageSouth = (y == 0);
+
+                if (y < _height - 1)
+                {
+                    for (int s = 0; s < span; s++)
+                    {
+                        if (IsWalkableFloorOrDoorway(x + s, y + 1)) { hasPassageNorth = true; break; }
+                    }
+                }
+                if (y > 0)
+                {
+                    for (int s = 0; s < span; s++)
+                    {
+                        if (IsWalkableFloorOrDoorway(x + s, y - 1)) { hasPassageSouth = true; break; }
+                    }
                 }
 
-                // Lock flanking left and right jamb tiles as solid Wall so the opening is the exact length 'span'
+                if (!hasPassageNorth || !hasPassageSouth)
+                {
+                    // Doorway leads into a solid wall — revert all span tiles to solid Wall so no door can spawn inside!
+                    for (int s = 0; s < span; s++)
+                    {
+                        if (_grid[x + s, y] == CellType.Doorway)
+                        {
+                            _grid[x + s, y] = CellType.Wall;
+                        }
+                    }
+                    continue;
+                }
+
+                // ── SAFETY CHECK 2: Lock solid wall jambs and set all doorway opening tiles ──
                 if (x - 1 >= 0 && _grid[x - 1, y] != CellType.Window)
                 {
                     _grid[x - 1, y] = CellType.Wall;
@@ -2380,14 +2441,29 @@ public class FactoryMapGenerator : NetworkBehaviour
                 {
                     _grid[x + span, y] = CellType.Wall;
                 }
+                for (int s = 0; s < span; s++)
+                {
+                    _grid[x + s, y] = CellType.Doorway;
+                    handled[x + s, y] = true;
+                }
 
-                // Spawn SwingDoor(s) filling 100% of the doorway span from (x - 0.5f) to (x + span - 0.5f)
+                // ── SAFETY CHECK 3: Clear any cover pillars immediately in front of or behind doorway ──
+                for (int s = 0; s < span; s++)
+                {
+                    if (y > 0 && _grid[x + s, y - 1] == CellType.CoverPillar)
+                        _grid[x + s, y - 1] = CellType.HallwayFloor;
+                    if (y < _height - 1 && _grid[x + s, y + 1] == CellType.CoverPillar)
+                        _grid[x + s, y + 1] = CellType.HallwayFloor;
+                }
+
+                // ── SAFETY CHECK 4: Spawn doors flush to wall jambs, filling 100% of doorway width ──
                 float totalLeafLen;
+                Vector2 leftJambWorld = GridToWorld(x - 0.5f, y);
+                Vector2 rightJambWorld = GridToWorld(x + span - 0.5f, y);
+
                 if (span >= 3)
                 {
                     float halfLen = span * 0.5f;
-                    Vector2 leftJambWorld = GridToWorld(x - 0.5f, y);
-                    Vector2 rightJambWorld = GridToWorld(x + span - 0.5f, y);
                     SpawnSwingDoor(leftJambWorld, 0f, halfLen);
                     SpawnSwingDoor(rightJambWorld, 180f, halfLen);
                     totalLeafLen = halfLen * 2f;
@@ -2395,7 +2471,6 @@ public class FactoryMapGenerator : NetworkBehaviour
                 else
                 {
                     float fullLen = span;
-                    Vector2 leftJambWorld = GridToWorld(x - 0.5f, y);
                     SpawnSwingDoor(leftJambWorld, 0f, fullLen);
                     totalLeafLen = fullLen;
                 }
@@ -2410,27 +2485,51 @@ public class FactoryMapGenerator : NetworkBehaviour
                     TotalDoorLeafLength = totalLeafLen
                 });
             }
-        }
-
-        // 2. Vertical doorway runs (along Y at fixed X)
-        for (int x = 0; x < _width; x++)
-        {
-            for (int y = 0; y < _height; y++)
+            else // Vertical doorway
             {
-                if (handled[x, y] || _grid[x, y] != CellType.Doorway) continue;
+                if (x < 0 || x >= _width || y < 1 || y + span >= _height - 1) continue;
 
-                int span = 1;
-                while (y + span < _height && !handled[x, y + span] && _grid[x, y + span] == CellType.Doorway)
-                {
-                    span++;
-                }
-
+                // Check if any tile in this doorway was already handled
+                bool alreadyHandled = false;
                 for (int s = 0; s < span; s++)
                 {
-                    handled[x, y + s] = true;
+                    if (handled[x, y + s]) { alreadyHandled = true; break; }
+                }
+                if (alreadyHandled) continue;
+
+                // ── SAFETY CHECK 1: Ensure doorway connects two open walkable spaces (East & West) ──
+                bool hasPassageEast = (x == _width - 1);
+                bool hasPassageWest = (x == 0);
+
+                if (x < _width - 1)
+                {
+                    for (int s = 0; s < span; s++)
+                    {
+                        if (IsWalkableFloorOrDoorway(x + 1, y + s)) { hasPassageEast = true; break; }
+                    }
+                }
+                if (x > 0)
+                {
+                    for (int s = 0; s < span; s++)
+                    {
+                        if (IsWalkableFloorOrDoorway(x - 1, y + s)) { hasPassageWest = true; break; }
+                    }
                 }
 
-                // Lock flanking bottom and top jamb tiles as solid Wall so the opening is the exact length 'span'
+                if (!hasPassageEast || !hasPassageWest)
+                {
+                    // Doorway leads into a solid wall — revert all span tiles to solid Wall so no door can spawn inside!
+                    for (int s = 0; s < span; s++)
+                    {
+                        if (_grid[x, y + s] == CellType.Doorway)
+                        {
+                            _grid[x, y + s] = CellType.Wall;
+                        }
+                    }
+                    continue;
+                }
+
+                // ── SAFETY CHECK 2: Lock solid wall jambs and set all doorway opening tiles ──
                 if (y - 1 >= 0 && _grid[x, y - 1] != CellType.Window)
                 {
                     _grid[x, y - 1] = CellType.Wall;
@@ -2439,14 +2538,29 @@ public class FactoryMapGenerator : NetworkBehaviour
                 {
                     _grid[x, y + span] = CellType.Wall;
                 }
+                for (int s = 0; s < span; s++)
+                {
+                    _grid[x, y + s] = CellType.Doorway;
+                    handled[x, y + s] = true;
+                }
 
-                // Spawn SwingDoor(s) filling 100% of the doorway span from (y - 0.5f) to (y + span - 0.5f)
+                // ── SAFETY CHECK 3: Clear any cover pillars immediately on either side of doorway ──
+                for (int s = 0; s < span; s++)
+                {
+                    if (x > 0 && _grid[x - 1, y + s] == CellType.CoverPillar)
+                        _grid[x - 1, y + s] = CellType.HallwayFloor;
+                    if (x < _width - 1 && _grid[x + 1, y + s] == CellType.CoverPillar)
+                        _grid[x + 1, y + s] = CellType.HallwayFloor;
+                }
+
+                // ── SAFETY CHECK 4: Spawn doors flush to wall jambs, filling 100% of doorway width ──
                 float totalLeafLen;
+                Vector2 bottomJambWorld = GridToWorld(x, y - 0.5f);
+                Vector2 topJambWorld = GridToWorld(x, y + span - 0.5f);
+
                 if (span >= 3)
                 {
                     float halfLen = span * 0.5f;
-                    Vector2 bottomJambWorld = GridToWorld(x, y - 0.5f);
-                    Vector2 topJambWorld = GridToWorld(x, y + span - 0.5f);
                     SpawnSwingDoor(bottomJambWorld, 90f, halfLen);
                     SpawnSwingDoor(topJambWorld, -90f, halfLen);
                     totalLeafLen = halfLen * 2f;
@@ -2454,7 +2568,6 @@ public class FactoryMapGenerator : NetworkBehaviour
                 else
                 {
                     float fullLen = span;
-                    Vector2 bottomJambWorld = GridToWorld(x, y - 0.5f);
                     SpawnSwingDoor(bottomJambWorld, 90f, fullLen);
                     totalLeafLen = fullLen;
                 }
@@ -2468,6 +2581,18 @@ public class FactoryMapGenerator : NetworkBehaviour
                     Span = span,
                     TotalDoorLeafLength = totalLeafLen
                 });
+            }
+        }
+
+        // ── SAFETY CHECK 5: Convert any leftover rogue CellType.Doorway tiles to HallwayFloor ──
+        for (int x = 0; x < _width; x++)
+        {
+            for (int y = 0; y < _height; y++)
+            {
+                if (_grid[x, y] == CellType.Doorway && !handled[x, y])
+                {
+                    _grid[x, y] = CellType.HallwayFloor;
+                }
             }
         }
     }

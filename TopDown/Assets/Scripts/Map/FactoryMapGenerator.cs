@@ -264,6 +264,9 @@ public class FactoryMapGenerator : NetworkBehaviour
     /// <summary>True when 100% of doorways across all active floors have doors spawned that fill 100% of the doorway length.</summary>
     public bool AllDoorsFillDoorwaysVerified { get; private set; }
 
+    /// <summary>True when 100% of doors across all active floors are verified clear of any obstructing cover pillars or walls.</summary>
+    public bool AllDoorsClearOfPillarsVerified { get; private set; }
+
     /// <summary>Minimum hallway width in world units observed across the generated map.</summary>
     public float MinObservedHallwayWidthWorld { get; private set; }
 
@@ -724,6 +727,7 @@ public class FactoryMapGenerator : NetworkBehaviour
         AllEntrancesVerifiedClear = false;
         AllHallwaysMeetMinWidth = true;
         AllDoorsFillDoorwaysVerified = true;
+        AllDoorsClearOfPillarsVerified = true;
         MinObservedHallwayWidthWorld = float.MaxValue;
         CurrentLocalFloorLevel = 0;
         CurrentStairClimbProgress = -1f;
@@ -2132,8 +2136,10 @@ public class FactoryMapGenerator : NetworkBehaviour
         int doorSpan = (room.width <= 8 || room.height <= 8) ? 3 : GetDoorwaySpan();
         if (room.width - 2 < doorSpan || room.height - 2 < doorSpan) return false;
 
-        int doorX = Mathf.Clamp(room.xMin + (room.width - doorSpan) / 2, room.xMin + 1, room.xMax - doorSpan - 1);
-        int doorY = Mathf.Clamp(room.yMin + (room.height - doorSpan) / 2, room.yMin + 1, room.yMax - doorSpan - 1);
+        int marginX = (room.width >= doorSpan + 4) ? 2 : 1;
+        int marginY = (room.height >= doorSpan + 4) ? 2 : 1;
+        int doorX = Mathf.Clamp(room.xMin + (room.width - doorSpan) / 2, room.xMin + marginX, room.xMax - doorSpan - marginX);
+        int doorY = Mathf.Clamp(room.yMin + (room.height - doorSpan) / 2, room.yMin + marginY, room.yMax - doorSpan - marginY);
         int hallStartX = Mathf.Clamp(doorX - (hw - doorSpan) / 2, 2, _width - hw - 2);
         int hallStartY = Mathf.Clamp(doorY - (hw - doorSpan) / 2, 2, _height - hw - 2);
         const int maxDist = 36;
@@ -2320,8 +2326,10 @@ public class FactoryMapGenerator : NetworkBehaviour
         int hw = GetConfiguredHallwayWidth();
         int doorSpan = (room.width <= 8 || room.height <= 8) ? 2 : GetDoorwaySpan();
 
-        int doorX = Mathf.Clamp(room.xMin + (room.width - doorSpan) / 2, room.xMin + 1, room.xMax - doorSpan - 1);
-        int doorY = Mathf.Clamp(room.yMin + (room.height - doorSpan) / 2, room.yMin + 1, room.yMax - doorSpan - 1);
+        int marginX = (room.width >= doorSpan + 4) ? 2 : 1;
+        int marginY = (room.height >= doorSpan + 4) ? 2 : 1;
+        int doorX = Mathf.Clamp(room.xMin + (room.width - doorSpan) / 2, room.xMin + marginX, room.xMax - doorSpan - marginX);
+        int doorY = Mathf.Clamp(room.yMin + (room.height - doorSpan) / 2, room.yMin + marginY, room.yMax - doorSpan - marginY);
         int hallStartX = Mathf.Clamp(doorX - (hw - doorSpan) / 2, 2, _width - hw - 2);
         int hallStartY = Mathf.Clamp(doorY - (hw - doorSpan) / 2, 2, _height - hw - 2);
 
@@ -2577,74 +2585,86 @@ public class FactoryMapGenerator : NetworkBehaviour
         out Vector2Int doorCell,
         out bool horizontalDoor)
     {
+        int marginX = (room.width >= doorSpan + 4) ? 2 : 1;
+        int marginY = (room.height >= doorSpan + 4) ? 2 : 1;
         var candidates = new List<(Vector2Int cell, bool horiz)>();
 
-        if (room.yMax + 1 < _height - 1)
+        void CollectCandidates(int mX, int mY)
         {
-            for (int x = room.xMin + 1; x <= room.xMax - 1 - doorSpan; x++)
+            candidates.Clear();
+            if (room.yMax + 1 < _height - 1)
             {
-                bool allHall = true;
-                for (int s = 0; s < doorSpan; s++)
+                for (int x = room.xMin + mX; x <= room.xMax - mX - doorSpan; x++)
                 {
-                    if (_grid[x + s, room.yMax + 1] != CellType.HallwayFloor)
+                    bool allHall = true;
+                    for (int s = 0; s < doorSpan; s++)
                     {
-                        allHall = false;
-                        break;
+                        if (_grid[x + s, room.yMax + 1] != CellType.HallwayFloor)
+                        {
+                            allHall = false;
+                            break;
+                        }
                     }
+                    if (allHall) candidates.Add((new Vector2Int(x, room.yMax), true));
                 }
-                if (allHall) candidates.Add((new Vector2Int(x, room.yMax), true));
+            }
+
+            if (room.yMin - 2 >= 1)
+            {
+                for (int x = room.xMin + mX; x <= room.xMax - mX - doorSpan; x++)
+                {
+                    bool allHall = true;
+                    for (int s = 0; s < doorSpan; s++)
+                    {
+                        if (_grid[x + s, room.yMin - 2] != CellType.HallwayFloor)
+                        {
+                            allHall = false;
+                            break;
+                        }
+                    }
+                    if (allHall) candidates.Add((new Vector2Int(x, room.yMin - 1), true));
+                }
+            }
+
+            if (room.xMax + 1 < _width - 1)
+            {
+                for (int y = room.yMin + mY; y <= room.yMax - mY - doorSpan; y++)
+                {
+                    bool allHall = true;
+                    for (int s = 0; s < doorSpan; s++)
+                    {
+                        if (_grid[room.xMax + 1, y + s] != CellType.HallwayFloor)
+                        {
+                            allHall = false;
+                            break;
+                        }
+                    }
+                    if (allHall) candidates.Add((new Vector2Int(room.xMax, y), false));
+                }
+            }
+
+            if (room.xMin - 2 >= 1)
+            {
+                for (int y = room.yMin + mY; y <= room.yMax - mY - doorSpan; y++)
+                {
+                    bool allHall = true;
+                    for (int s = 0; s < doorSpan; s++)
+                    {
+                        if (_grid[room.xMin - 2, y + s] != CellType.HallwayFloor)
+                        {
+                            allHall = false;
+                            break;
+                        }
+                    }
+                    if (allHall) candidates.Add((new Vector2Int(room.xMin - 1, y), false));
+                }
             }
         }
 
-        if (room.yMin - 2 >= 1)
+        CollectCandidates(marginX, marginY);
+        if (candidates.Count == 0 && (marginX > 1 || marginY > 1))
         {
-            for (int x = room.xMin + 1; x <= room.xMax - 1 - doorSpan; x++)
-            {
-                bool allHall = true;
-                for (int s = 0; s < doorSpan; s++)
-                {
-                    if (_grid[x + s, room.yMin - 2] != CellType.HallwayFloor)
-                    {
-                        allHall = false;
-                        break;
-                    }
-                }
-                if (allHall) candidates.Add((new Vector2Int(x, room.yMin - 1), true));
-            }
-        }
-
-        if (room.xMax + 1 < _width - 1)
-        {
-            for (int y = room.yMin + 1; y <= room.yMax - 1 - doorSpan; y++)
-            {
-                bool allHall = true;
-                for (int s = 0; s < doorSpan; s++)
-                {
-                    if (_grid[room.xMax + 1, y + s] != CellType.HallwayFloor)
-                    {
-                        allHall = false;
-                        break;
-                    }
-                }
-                if (allHall) candidates.Add((new Vector2Int(room.xMax, y), false));
-            }
-        }
-
-        if (room.xMin - 2 >= 1)
-        {
-            for (int y = room.yMin + 1; y <= room.yMax - 1 - doorSpan; y++)
-            {
-                bool allHall = true;
-                for (int s = 0; s < doorSpan; s++)
-                {
-                    if (_grid[room.xMin - 2, y + s] != CellType.HallwayFloor)
-                    {
-                        allHall = false;
-                        break;
-                    }
-                }
-                if (allHall) candidates.Add((new Vector2Int(room.xMin - 1, y), false));
-            }
+            CollectCandidates(1, 1);
         }
 
         if (candidates.Count == 0)
@@ -2681,7 +2701,7 @@ public class FactoryMapGenerator : NetworkBehaviour
             });
         }
 
-        MarkDoorwayClearanceZone(x, y - 3, doorSpan, 7);
+        MarkDoorwayClearanceZone(x - 2, y - 4, doorSpan + 4, 9);
     }
 
     private void CarveVerticalDoorway(int x, int y, int doorSpan)
@@ -2705,7 +2725,7 @@ public class FactoryMapGenerator : NetworkBehaviour
             });
         }
 
-        MarkDoorwayClearanceZone(x - 3, y, 7, doorSpan);
+        MarkDoorwayClearanceZone(x - 4, y - 2, 9, doorSpan + 4);
     }
 
     /// <summary>
@@ -2789,13 +2809,17 @@ public class FactoryMapGenerator : NetworkBehaviour
                     handled[x + s, y] = true;
                 }
 
-                // ── SAFETY CHECK 3: Clear any cover pillars immediately in front of or behind doorway ──
-                for (int s = 0; s < span; s++)
+                // ── SAFETY CHECK 3: Clear any cover pillars in the entire door swing and approach zone ──
+                for (int cx = x - 2; cx <= x + span + 1; cx++)
                 {
-                    if (y > 0 && _grid[x + s, y - 1] == CellType.CoverPillar)
-                        _grid[x + s, y - 1] = CellType.HallwayFloor;
-                    if (y < _height - 1 && _grid[x + s, y + 1] == CellType.CoverPillar)
-                        _grid[x + s, y + 1] = CellType.HallwayFloor;
+                    for (int cy = y - 4; cy <= y + 4; cy++)
+                    {
+                        if (cx >= 0 && cx < _width && cy >= 0 && cy < _height)
+                        {
+                            if (_grid[cx, cy] == CellType.CoverPillar)
+                                _grid[cx, cy] = CellType.RoomFloor;
+                        }
+                    }
                 }
 
                 // ── SAFETY CHECK 4: Spawn doors flush to wall jambs, filling 100% of doorway width ──
@@ -2886,13 +2910,17 @@ public class FactoryMapGenerator : NetworkBehaviour
                     handled[x, y + s] = true;
                 }
 
-                // ── SAFETY CHECK 3: Clear any cover pillars immediately on either side of doorway ──
-                for (int s = 0; s < span; s++)
+                // ── SAFETY CHECK 3: Clear any cover pillars in the entire door swing and approach zone ──
+                for (int cx = x - 4; cx <= x + 4; cx++)
                 {
-                    if (x > 0 && _grid[x - 1, y + s] == CellType.CoverPillar)
-                        _grid[x - 1, y + s] = CellType.HallwayFloor;
-                    if (x < _width - 1 && _grid[x + 1, y + s] == CellType.CoverPillar)
-                        _grid[x + 1, y + s] = CellType.HallwayFloor;
+                    for (int cy = y - 2; cy <= y + span + 1; cy++)
+                    {
+                        if (cx >= 0 && cx < _width && cy >= 0 && cy < _height)
+                        {
+                            if (_grid[cx, cy] == CellType.CoverPillar)
+                                _grid[cx, cy] = CellType.RoomFloor;
+                        }
+                    }
                 }
 
                 // ── SAFETY CHECK 4: Spawn doors flush to wall jambs, filling 100% of doorway width ──
@@ -2991,10 +3019,23 @@ public class FactoryMapGenerator : NetworkBehaviour
                 int px = rng.Next(room.Bounds.xMin + 2, room.Bounds.xMax - 1 - pillarSize);
                 int py = rng.Next(room.Bounds.yMin + 2, room.Bounds.yMax - 1 - pillarSize);
 
-                if (_entranceProtectedZone[px, py] || IsNearAnyDoorwayOrEntrance(px, py, 4.5f))
+                // SAFETY CHECK: Verify EVERY tile of the proposed pillar is clear of doorways, swing arcs, and entrances
+                bool blocked = false;
+                for (int dx = 0; dx < pillarSize; dx++)
                 {
-                    continue;
+                    for (int dy = 0; dy < pillarSize; dy++)
+                    {
+                        int cx = px + dx;
+                        int cy = py + dy;
+                        if (_entranceProtectedZone[cx, cy] || IsNearAnyDoorwayOrEntrance(cx, cy, 5.0f))
+                        {
+                            blocked = true;
+                            break;
+                        }
+                    }
+                    if (blocked) break;
                 }
+                if (blocked) continue;
 
                 if (room.Archetype == RoomArchetype.ObjectiveHub)
                 {
@@ -3031,7 +3072,26 @@ public class FactoryMapGenerator : NetworkBehaviour
             if ((cell - d).sqrMagnitude < minDistSq) return true;
         }
 
-        if (_currentFloor.FloorLevel == 0)
+        if (_currentFloor != null)
+        {
+            for (int i = 0; i < _currentFloor.DesignatedDoorways.Count; i++)
+            {
+                var dd = _currentFloor.DesignatedDoorways[i];
+                int minX = dd.IsHorizontal ? dd.StartX - 2 : dd.StartX - 4;
+                int maxX = dd.IsHorizontal ? dd.StartX + dd.Span + 1 : dd.StartX + 4;
+                int minY = dd.IsHorizontal ? dd.StartY - 4 : dd.StartY - 2;
+                int maxY = dd.IsHorizontal ? dd.StartY + 4 : dd.StartY + dd.Span + 1;
+                if (gx >= minX && gx <= maxX && gy >= minY && gy <= maxY) return true;
+
+                for (int s = 0; s < dd.Span; s++)
+                {
+                    Vector2 d = dd.IsHorizontal ? new Vector2(dd.StartX + s, dd.StartY) : new Vector2(dd.StartX, dd.StartY + s);
+                    if ((cell - d).sqrMagnitude < minDistSq) return true;
+                }
+            }
+        }
+
+        if (_currentFloor != null && _currentFloor.FloorLevel == 0)
         {
             for (int e = 0; e < 4; e++)
             {
@@ -3128,9 +3188,9 @@ public class FactoryMapGenerator : NetworkBehaviour
         for (int i = 0; i < _doorwayCells.Count; i++)
         {
             Vector2Int dc = _doorwayCells[i];
-            for (int dx = -3; dx <= 3; dx++)
+            for (int dx = -4; dx <= 4; dx++)
             {
-                for (int dy = -3; dy <= 3; dy++)
+                for (int dy = -4; dy <= 4; dy++)
                 {
                     int nx = dc.x + dx;
                     int ny = dc.y + dy;
@@ -3139,6 +3199,32 @@ public class FactoryMapGenerator : NetworkBehaviour
                         if (_grid[nx, ny] == CellType.CoverPillar)
                         {
                             _grid[nx, ny] = CellType.RoomFloor;
+                        }
+                    }
+                }
+            }
+        }
+
+        if (_currentFloor != null)
+        {
+            for (int i = 0; i < _currentFloor.DesignatedDoorways.Count; i++)
+            {
+                var dd = _currentFloor.DesignatedDoorways[i];
+                int minX = dd.IsHorizontal ? dd.StartX - 2 : dd.StartX - 4;
+                int maxX = dd.IsHorizontal ? dd.StartX + dd.Span + 1 : dd.StartX + 4;
+                int minY = dd.IsHorizontal ? dd.StartY - 4 : dd.StartY - 2;
+                int maxY = dd.IsHorizontal ? dd.StartY + 4 : dd.StartY + dd.Span + 1;
+
+                for (int cx = minX; cx <= maxX; cx++)
+                {
+                    for (int cy = minY; cy <= maxY; cy++)
+                    {
+                        if (cx > 0 && cx < _width - 1 && cy > 0 && cy < _height - 1)
+                        {
+                            if (_grid[cx, cy] == CellType.CoverPillar)
+                            {
+                                _grid[cx, cy] = CellType.RoomFloor;
+                            }
                         }
                     }
                 }
@@ -3733,6 +3819,60 @@ public class FactoryMapGenerator : NetworkBehaviour
             }
         }
         AllDoorsFillDoorwaysVerified = doorsValid;
+
+        // 4. Doorway swing clearance & cover pillar obstruction verification
+        // Ensure no door leaf swing path is obstructed by a cover pillar or wall stub
+        for (int i = 0; i < _spawnedDoors.Count; i++)
+        {
+            var door = _spawnedDoors[i];
+            if (door == null) continue;
+
+            Vector2 hingePos = door.HingeWorldPos;
+            float checkRadius = door.DoorLength + 0.35f;
+            Collider2D[] doorHits = Physics2D.OverlapCircleAll(hingePos, checkRadius);
+            for (int h = 0; h < doorHits.Length; h++)
+            {
+                var hit = doorHits[h];
+                if (hit == null || hit.isTrigger) continue;
+
+                if (hit.GetComponent<SwingDoor>() != null || hit.GetComponentInParent<SwingDoor>() != null) continue;
+                if (hit.GetComponent<PlayerController>() != null || hit.GetComponent<DummyController>() != null) continue;
+
+                // If it's a CoverPillar, it obstructs the door swing/approach! Immediately disable and destroy it!
+                if (hit.gameObject.name == "CoverPillar")
+                {
+                    hit.gameObject.SetActive(false);
+                    Destroy(hit.gameObject);
+                }
+            }
+        }
+
+        Physics2D.SyncTransforms();
+        bool allDoorsClear = true;
+        for (int i = 0; i < _spawnedDoors.Count; i++)
+        {
+            var door = _spawnedDoors[i];
+            if (door == null) continue;
+
+            Vector2 hingePos = door.HingeWorldPos;
+            float checkRadius = door.DoorLength + 0.35f;
+            Collider2D[] remainingHits = Physics2D.OverlapCircleAll(hingePos, checkRadius);
+            for (int h = 0; h < remainingHits.Length; h++)
+            {
+                var hit = remainingHits[h];
+                if (hit == null || hit.isTrigger || !hit.gameObject.activeInHierarchy) continue;
+                if (hit.GetComponent<SwingDoor>() != null || hit.GetComponentInParent<SwingDoor>() != null) continue;
+                if (hit.GetComponent<PlayerController>() != null || hit.GetComponent<DummyController>() != null) continue;
+
+                if (hit.gameObject.name == "CoverPillar")
+                {
+                    allDoorsClear = false;
+                    break;
+                }
+            }
+            if (!allDoorsClear) break;
+        }
+        AllDoorsClearOfPillarsVerified = allDoorsClear;
     }
 
     private static void TeleportCharacter(GameObject character, Vector2 worldPos)

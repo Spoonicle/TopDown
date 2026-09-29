@@ -35,10 +35,10 @@ Welcome to this project. All AI agents, coding assistants, and automated tools w
 - Challenge your own work before presenting it
 
 ### 6. Autonomous Bug Fixing
-- When given a bug report: just fix it. Don't ask for hand-holding
-- Point at logs, errors, failing tests - then resolve them
-- Zero context switching required from the user
-- Go fix failing CI tests without being told how
+- When given a bug report: resolve the root cause autonomously without requiring step-by-step guidance.
+- Point at logs, errors, failing tests - then resolve them.
+- Ask clarifying questions whenever user preferences, edge cases, or design intents need confirmation (see Rule 13).
+- Zero unnecessary context switching required from the user; fix failing tests without being told how.
 
 ### 7. Subagent Strategy
 - Spawn subagents liberally to keep main context window clean
@@ -78,3 +78,7 @@ Welcome to this project. All AI agents, coding assistants, and automated tools w
   - **Replication (`NetworkVariable` & `Rpc`)**: Sync persistent state via `NetworkVariable<T>` and broadcast transient events (shots, tracers, muzzle flashes, explosions, radio callouts) via `[Rpc]`.
 - **Dynamic N-Team Support**: Never hardcode a fixed two-team enum. Always use `TeamData` ScriptableObjects and `TeamMember.CanDamage(attacker, target)` so any number of teams works out of the box (*cannot shoot/damage own team; can shoot/damage all other teams*).
 - **Zero-Friction Solo Playtesting**: Ensure `NetworkBootstrap` auto-starts as Host in the Editor and keep safe `!IsSpawned` fallbacks so pressing Play immediately works for solo testing against dummies.
+
+### 13. Clarifying Questions & Inquiry
+- All agents, coding assistants, and subagents are explicitly allowed and encouraged to ask the user any questions they need answered before or during execution.
+- If requirements are underspecified, design decisions need user input, or edge cases arise, prompt the user for clarification rather than making assumptions.

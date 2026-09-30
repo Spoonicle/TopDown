@@ -12,13 +12,33 @@ public class FactoryMapConfig : ScriptableObject
     // ───────────────────────────── Building Footprint ───────────────────────
 
     [Header("Building Dimensions")]
-    [Tooltip("Width of the concrete factory building in tiles (1 tile = 1 world unit).")]
+    [Tooltip("If true, width and height are rolled randomly per seed within the min/max ranges below. "
+           + "If false, the fixed Width and Height fields are used.")]
+    [SerializeField] private bool _useRandomAspectRatio = true;
+
+    [Tooltip("Width of the concrete factory building in tiles when NOT using random aspect ratio.")]
     [Range(24, 160)]
     [SerializeField] private int _buildingWidth = 108;
 
-    [Tooltip("Height of the concrete factory building in tiles (1 tile = 1 world unit).")]
+    [Tooltip("Height of the concrete factory building in tiles when NOT using random aspect ratio.")]
     [Range(24, 160)]
     [SerializeField] private int _buildingHeight = 108;
+
+    [Tooltip("Minimum building width in tiles when using random aspect ratio.")]
+    [Range(60, 160)]
+    [SerializeField] private int _buildingWidthMin = 80;
+
+    [Tooltip("Maximum building width in tiles when using random aspect ratio.")]
+    [Range(60, 200)]
+    [SerializeField] private int _buildingWidthMax = 140;
+
+    [Tooltip("Minimum building height in tiles when using random aspect ratio.")]
+    [Range(60, 160)]
+    [SerializeField] private int _buildingHeightMin = 70;
+
+    [Tooltip("Maximum building height in tiles when using random aspect ratio.")]
+    [Range(60, 200)]
+    [SerializeField] private int _buildingHeightMax = 130;
 
     [Tooltip("Width of the exterior courtyard around the factory where teams spawn and extract.")]
     [Range(5, 30)]
@@ -110,11 +130,26 @@ public class FactoryMapConfig : ScriptableObject
 
     // ───────────────────────────── Public Accessors ─────────────────────────
 
-    /// <summary>Width of the factory building in tiles.</summary>
+    /// <summary>If true, building dimensions are rolled per seed within the min/max ranges.</summary>
+    public bool UseRandomAspectRatio => _useRandomAspectRatio;
+
+    /// <summary>Fixed building width in tiles (used when UseRandomAspectRatio is false).</summary>
     public int BuildingWidth => _buildingWidth;
 
-    /// <summary>Height of the factory building in tiles.</summary>
+    /// <summary>Fixed building height in tiles (used when UseRandomAspectRatio is false).</summary>
     public int BuildingHeight => _buildingHeight;
+
+    /// <summary>Minimum building width when using random aspect ratio.</summary>
+    public int BuildingWidthMin => _buildingWidthMin;
+
+    /// <summary>Maximum building width when using random aspect ratio.</summary>
+    public int BuildingWidthMax => _buildingWidthMax;
+
+    /// <summary>Minimum building height when using random aspect ratio.</summary>
+    public int BuildingHeightMin => _buildingHeightMin;
+
+    /// <summary>Maximum building height when using random aspect ratio.</summary>
+    public int BuildingHeightMax => _buildingHeightMax;
 
     /// <summary>Outer courtyard margin in tiles.</summary>
     public int CourtyardMargin => _courtyardMargin;

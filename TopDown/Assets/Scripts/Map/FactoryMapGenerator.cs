@@ -712,8 +712,23 @@ public class FactoryMapGenerator : NetworkBehaviour
         _lastGeneratedSeed = seed;
         var rng = new System.Random(seed);
 
-        _width = _config != null ? _config.BuildingWidth : 108;
-        _height = _config != null ? _config.BuildingHeight : 108;
+        // Roll building dimensions — support both fixed and seeded-random aspect ratios
+        if (_config != null && _config.UseRandomAspectRatio)
+        {
+            // Roll width independently of height so the building is not constrained to be square
+            int wMin = Mathf.Max(60, _config.BuildingWidthMin);
+            int wMax = Mathf.Max(wMin + 10, _config.BuildingWidthMax);
+            int hMin = Mathf.Max(60, _config.BuildingHeightMin);
+            int hMax = Mathf.Max(hMin + 10, _config.BuildingHeightMax);
+            // Round to nearest even number so entrances / hallways stay symmetric
+            _width  = (rng.Next(wMin, wMax + 1) / 2) * 2;
+            _height = (rng.Next(hMin, hMax + 1) / 2) * 2;
+        }
+        else
+        {
+            _width  = _config != null ? _config.BuildingWidth  : 108;
+            _height = _config != null ? _config.BuildingHeight : 108;
+        }
 
         _activeFloors.Clear();
         _floorStates.Clear();
@@ -823,36 +838,34 @@ public class FactoryMapGenerator : NetworkBehaviour
     {
         if (_activeFloors.Count <= 1) return;
 
-        int objSize = _config != null ? _config.ObjectiveRoomSize : 24;
         int hw = Mathf.Max(GetMinHallwayWidthTiles(), _config != null ? _config.HallwayWidth : 6);
-        int centralMinX = (_width - objSize) / 2;
-        int centralMinY = (_height - objSize) / 2;
-        int ringMinX = centralMinX - 1 - hw;
-        int ringMaxX = centralMinX + objSize + 1 + hw;
-        int ringMinY = centralMinY - 1 - hw;
-        int ringMaxY = centralMinY + objSize + 1 + hw;
+        int margin = (_config != null ? _config.EntranceCornerMargin : 18) + hw + 2;
 
-        int westBayX = ringMinX - 5;
-        int westThroatX = ringMinX - 1;
-        int eastBayX = ringMaxX + 1;
-        int eastThroatX = ringMaxX;
+        // Bay is 4 tiles wide (BayX..BayX+3), 10 tiles tall (BayMinY..BayMinY+9).
+        // Build a pool of candidate bay positions along the West and East interior margins,
+        // distributed vertically so they don't collide with entrance vestibules.
+        int westBayX   = margin;
+        int westThroatX = westBayX + 4;  // throat opens to the east, into the interior
+        int eastBayX   = _width - margin - 4;
+        int eastThroatX = eastBayX - 1;  // throat opens to the west, into the interior
 
-        int northBayMinY = ringMaxY - 12;
-        int centerBayMinY = ringMinY + 14;
-        int southBayMinY = ringMinY + 2;
+        // Three vertical positions — top quarter, mid, bottom quarter — per side
+        int bayYTop    = margin;
+        int bayYMid    = (_height - 10) / 2;
+        int bayYBot    = _height - margin - 10;
 
         var pool0 = new (int bayX, int bayMinY, int throatX, bool opensEast)[]
         {
-            (westBayX, northBayMinY, westThroatX, true),
-            (eastBayX, northBayMinY, eastThroatX, false),
-            (westBayX, centerBayMinY, westThroatX, true)
+            (westBayX, bayYTop, westThroatX, true),
+            (eastBayX, bayYTop, eastThroatX, false),
+            (westBayX, bayYMid, westThroatX, true)
         };
 
         var pool1 = new (int bayX, int bayMinY, int throatX, bool opensEast)[]
         {
-            (eastBayX, southBayMinY, eastThroatX, false),
-            (westBayX, southBayMinY, westThroatX, true),
-            (eastBayX, centerBayMinY, eastThroatX, false)
+            (eastBayX, bayYBot, eastThroatX, false),
+            (westBayX, bayYBot, westThroatX, true),
+            (eastBayX, bayYMid, eastThroatX, false)
         };
 
         for (int t = 0; t < _activeFloors.Count - 1; t++)
@@ -921,16 +934,13 @@ public class FactoryMapGenerator : NetworkBehaviour
             }
         }
 
-        // 2. Carve Central Room
-        bool isObjectiveFloor = (floorLevel == _objectiveFloorLevel);
-        PlaceCentralRoom(rng, isObjectiveFloor);
-
-        // 3. Carve the Inner Ring Hallway around the Central Room & reserve/carve Stairwell Bays
-        RectInt ringOuter = CarveInnerRingHallway();
-        state.RingOuterBounds = ringOuter;
+        // 2. Reserve + carve stairwell bays FIRST so BSP and entrances avoid them
         CarveAndReserveStairwellBaysForFloor(floorLevel);
 
-        // 4. Carve perimeter entrances (1st Floor) or internal arterial corridors (non-ground floors)
+        // 3. Carve perimeter entrances (1st Floor) or internal arterial corridors (non-ground floors).
+        //    We compute a dummy ringOuter covering the full interior so L-corridor helpers work correctly.
+        RectInt ringOuter = new RectInt(2, 2, _width - 4, _height - 4);
+        state.RingOuterBounds = ringOuter;
         if (floorLevel == 0)
         {
             PlaceAndConnectFourEntrances(rng, ringOuter);
@@ -940,22 +950,39 @@ public class FactoryMapGenerator : NetworkBehaviour
             CarveNonGroundFloorArterialHallways(rng, ringOuter);
         }
 
-        // 5. Carve rooms via BSP (Binary Space Partitioning) across 4 size archetypes
-        CarveInteriorRoomsViaBsp(rng);
+        // 4. Carve ALL rooms via BSP over the full interior.
+        //    On the objective floor the largest qualifying leaf is elected as the Objective Room.
+        bool isObjectiveFloor = (floorLevel == _objectiveFloorLevel);
+        CarveInteriorRoomsViaBsp(rng, isObjectiveFloor);
 
-        // 6. Connect rooms with secondary hallways and doorways according to each room's TargetDoorways (1–4)
+        // 4b. Synthesize a CentralRoomBounds from the objective/largest room for compatibility
+        //     with guard placement and BFS seeding helpers.
+        if (_rooms.Count > 0)
+        {
+            RoomData hub = _rooms[0];
+            for (int ri = 1; ri < _rooms.Count; ri++)
+            {
+                if (_rooms[ri].IsObjectiveRoom) { hub = _rooms[ri]; break; }
+                int hubArea = hub.Bounds.width * hub.Bounds.height;
+                int riArea  = _rooms[ri].Bounds.width * _rooms[ri].Bounds.height;
+                if (riArea > hubArea) hub = _rooms[ri];
+            }
+            state.CentralRoomBounds = hub.Bounds;
+        }
+
+        // 5. Connect rooms with secondary hallways and doorways according to each room's TargetDoorways (1–4)
         ConnectRoomsWithSecondaryHallwaysAndDoors(rng, ringOuter);
 
-        // 7. Place breakable glass windows in room walls bordering hallways or adjacent rooms
+        // 6. Place breakable glass windows in room walls bordering hallways or adjacent rooms
         PlaceRoomWindows(rng);
 
-        // 8. Place interior concrete cover pillars scaled to each room's archetype
+        // 7. Place interior concrete cover pillars scaled to each room's archetype
         PlaceInteriorCoverPillars(rng);
 
-        // 9. Safety pass — enforce 100% entrance, stairwell bay, doorway swing arc, BFS path, and >=1.5x player hallway width
+        // 8. Safety pass — enforce 100% entrance, stairwell bay, doorway swing arc, BFS path, and >=1.5x player hallway width
         EnforceFloorSafetyClearance(floorLevel, ringOuter);
 
-        // 9.5. Normalize all Doorway runs (lock flanking Wall jambs) & spawn full-span SwingDoors filling 100% of every doorway
+        // 8.5. Normalize all Doorway runs (lock flanking Wall jambs) & spawn full-span SwingDoors filling 100% of every doorway
         NormalizeAndSpawnAllDoorsForFloor(floorLevel);
 
         // 10. Instantiate greedy-merged concrete wall colliders and cover pillars for this floor
@@ -1054,40 +1081,6 @@ public class FactoryMapGenerator : NetworkBehaviour
         }
     }
 
-    private void PlaceCentralRoom(System.Random rng, bool isObjectiveRoom)
-    {
-        int objSize = _config != null ? _config.ObjectiveRoomSize : 24;
-        int startX = (_width - objSize) / 2;
-        int startY = (_height - objSize) / 2;
-
-        var bounds = new RectInt(startX, startY, objSize, objSize);
-        _currentFloor.CentralRoomBounds = bounds;
-        if (isObjectiveRoom)
-        {
-            _objectiveRoomBounds = bounds;
-        }
-
-        CellType floorType = isObjectiveRoom ? CellType.ObjectiveRoomFloor : CellType.RoomFloor;
-        for (int x = startX; x < startX + objSize; x++)
-        {
-            for (int y = startY; y < startY + objSize; y++)
-            {
-                _grid[x, y] = floorType;
-            }
-        }
-
-        _rooms.Add(new RoomData
-        {
-            FloorLevel = _currentFloor.FloorLevel,
-            Bounds = bounds,
-            Archetype = RoomArchetype.ObjectiveHub,
-            IsObjectiveRoom = isObjectiveRoom,
-            TargetDoorways = 4,
-            ActualDoorways = 4,
-            TargetWindows = rng.Next(2, 5)
-        });
-    }
-
     private int GetConfiguredHallwayWidth()
     {
         int cfg = _config != null ? _config.HallwayWidth : 6;
@@ -1098,44 +1091,6 @@ public class FactoryMapGenerator : NetworkBehaviour
     {
         int hw = GetConfiguredHallwayWidth();
         return hw >= 4 ? 4 : 2;
-    }
-
-    private RectInt CarveInnerRingHallway()
-    {
-        int hw = GetConfiguredHallwayWidth();
-        int doorSpan = GetDoorwaySpan();
-        RectInt central = _currentFloor.CentralRoomBounds;
-
-        int ringMinX = central.xMin - 1 - hw;
-        int ringMaxX = central.xMax + 1 + hw;
-        int ringMinY = central.yMin - 1 - hw;
-        int ringMaxY = central.yMax + 1 + hw;
-
-        for (int x = ringMinX; x < ringMaxX; x++)
-        {
-            for (int y = ringMinY; y < ringMaxY; y++)
-            {
-                bool inTopBand = y >= central.yMax + 1;
-                bool inBottomBand = y < central.yMin - 1;
-                bool inLeftBand = x < central.xMin - 1;
-                bool inRightBand = x >= central.xMax + 1;
-
-                if (inTopBand || inBottomBand || inLeftBand || inRightBand)
-                {
-                    _grid[x, y] = CellType.HallwayFloor;
-                }
-            }
-        }
-
-        int midX = central.xMin + (central.width - doorSpan) / 2;
-        int midY = central.yMin + (central.height - doorSpan) / 2;
-
-        CarveHorizontalDoorway(midX, central.yMax, doorSpan);
-        CarveHorizontalDoorway(midX, central.yMin - 1, doorSpan);
-        CarveVerticalDoorway(central.xMax, midY, doorSpan);
-        CarveVerticalDoorway(central.xMin - 1, midY, doorSpan);
-
-        return new RectInt(ringMinX, ringMinY, ringMaxX - ringMinX, ringMaxY - ringMinY);
     }
 
     /// <summary>
@@ -1226,9 +1181,43 @@ public class FactoryMapGenerator : NetworkBehaviour
         int vestibuleDepth = Mathf.Max(4, hw + 2);
         float halfHwOffset = (hw - 1) * 0.5f;
 
+        // Flanking corridors connecting the stairwells on West and East sides
+        int stairMargin = margin + hw + 2;
+        int westThroatX = stairMargin + 4;
+        int eastThroatX = _width - stairMargin - 5;
+        int eastHallX = eastThroatX - hw + 1;
+
+        // Central cross corridor connecting West and East flanking corridors
+        int crossY = (_height - hw) / 2;
+
+        int flankYMin = margin;
+        int flankYMax = _height - margin;
+
+        // 1. Carve West & East flanking hallways passing directly past stairwell bay throats
+        for (int y = flankYMin; y < flankYMax; y++)
+        {
+            for (int w = 0; w < hw; w++)
+            {
+                _grid[westThroatX + w, y] = CellType.HallwayFloor;
+                _grid[eastHallX + w, y]   = CellType.HallwayFloor;
+            }
+        }
+
+        // 2. Carve central East-West cross corridor connecting the two flanking corridors
+        for (int x = westThroatX; x <= eastHallX + hw - 1; x++)
+        {
+            for (int w = 0; w < hw; w++)
+            {
+                _grid[x, crossY + w] = CellType.HallwayFloor;
+            }
+        }
+
+        // 3. Place 4 Entrances and connect them into the arterial network:
+
         // 0 = North (y = _height - 1)
-        int minNorthX = Mathf.Max(margin, ringOuter.xMin + 1);
-        int maxNorthX = Mathf.Min(_width - margin - hw, ringOuter.xMax - hw - 1);
+        int minNorthX = Mathf.Max(margin, westThroatX + hw + 2);
+        int maxNorthX = Mathf.Min(_width - margin - hw, eastHallX - 2);
+        if (minNorthX > maxNorthX) { minNorthX = margin; maxNorthX = _width - margin - hw; }
         int northX = rng.Next(minNorthX, maxNorthX + 1);
         _entrances[0] = new EntranceData
         {
@@ -1239,13 +1228,14 @@ public class FactoryMapGenerator : NetworkBehaviour
         };
         CarveHorizontalDoorway(northX + doorOffset, _height - 1, doorSpan);
         ReserveEntranceVestibule(northX, _height - 1 - vestibuleDepth, hw, vestibuleDepth, 2);
-        CarveLCorridor(new Vector2Int(northX, _height - 1 - vestibuleDepth), new Vector2Int(
-            northX,
-            ringOuter.yMax - hw), hw, true);
+        CarveLCorridor(
+            new Vector2Int(northX, _height - 1 - vestibuleDepth),
+            new Vector2Int(northX, crossY + hw),
+            hw, true);
 
         // 1 = East (x = _width - 1)
-        int minEastY = Mathf.Max(margin, ringOuter.yMin + 1);
-        int maxEastY = Mathf.Min(_height - margin - hw, ringOuter.yMax - hw - 1);
+        int minEastY = margin;
+        int maxEastY = _height - margin - hw;
         int eastY = rng.Next(minEastY, maxEastY + 1);
         _entrances[1] = new EntranceData
         {
@@ -1256,13 +1246,15 @@ public class FactoryMapGenerator : NetworkBehaviour
         };
         CarveVerticalDoorway(_width - 1, eastY + doorOffset, doorSpan);
         ReserveEntranceVestibule(_width - 1 - vestibuleDepth, eastY, vestibuleDepth, hw, 2);
-        CarveLCorridor(new Vector2Int(_width - 1 - vestibuleDepth, eastY), new Vector2Int(
-            ringOuter.xMax - hw,
-            eastY), hw, false);
+        CarveLCorridor(
+            new Vector2Int(_width - 1 - vestibuleDepth, eastY),
+            new Vector2Int(eastHallX + hw - 1, eastY),
+            hw, false);
 
         // 2 = South (y = 0)
-        int minSouthX = Mathf.Max(margin, ringOuter.xMin + 1);
-        int maxSouthX = Mathf.Min(_width - margin - hw, ringOuter.xMax - hw - 1);
+        int minSouthX = Mathf.Max(margin, westThroatX + hw + 2);
+        int maxSouthX = Mathf.Min(_width - margin - hw, eastHallX - 2);
+        if (minSouthX > maxSouthX) { minSouthX = margin; maxSouthX = _width - margin - hw; }
         int southX = rng.Next(minSouthX, maxSouthX + 1);
         _entrances[2] = new EntranceData
         {
@@ -1273,13 +1265,14 @@ public class FactoryMapGenerator : NetworkBehaviour
         };
         CarveHorizontalDoorway(southX + doorOffset, 0, doorSpan);
         ReserveEntranceVestibule(southX, 1, hw, vestibuleDepth, 2);
-        CarveLCorridor(new Vector2Int(southX, vestibuleDepth), new Vector2Int(
-            southX,
-            ringOuter.yMin), hw, true);
+        CarveLCorridor(
+            new Vector2Int(southX, vestibuleDepth),
+            new Vector2Int(southX, crossY),
+            hw, true);
 
         // 3 = West (x = 0)
-        int minWestY = Mathf.Max(margin, ringOuter.yMin + 1);
-        int maxWestY = Mathf.Min(_height - margin - hw, ringOuter.yMax - hw - 1);
+        int minWestY = margin;
+        int maxWestY = _height - margin - hw;
         int westY = rng.Next(minWestY, maxWestY + 1);
         _entrances[3] = new EntranceData
         {
@@ -1290,9 +1283,10 @@ public class FactoryMapGenerator : NetworkBehaviour
         };
         CarveVerticalDoorway(0, westY + doorOffset, doorSpan);
         ReserveEntranceVestibule(1, westY, vestibuleDepth, hw, 2);
-        CarveLCorridor(new Vector2Int(vestibuleDepth, westY), new Vector2Int(
-            ringOuter.xMin,
-            westY), hw, false);
+        CarveLCorridor(
+            new Vector2Int(vestibuleDepth, westY),
+            new Vector2Int(westThroatX, westY),
+            hw, false);
     }
 
     private void CarveNonGroundFloorArterialHallways(System.Random rng, RectInt ringOuter)
@@ -1300,41 +1294,44 @@ public class FactoryMapGenerator : NetworkBehaviour
         int margin = _config != null ? _config.EntranceCornerMargin : 18;
         int hw = GetConfiguredHallwayWidth();
 
-        int minNorthX = Mathf.Max(margin, ringOuter.xMin + 1);
-        int maxNorthX = Mathf.Min(_width - margin - hw, ringOuter.xMax - hw - 1);
-        int northX = rng.Next(minNorthX, maxNorthX + 1);
-        CarveLCorridor(
-            new Vector2Int(northX, _height - 10 - hw),
-            new Vector2Int(northX, ringOuter.yMax - hw),
-            hw,
-            true);
+        int stairMargin = margin + hw + 2;
+        int westThroatX = stairMargin + 4;
+        int eastThroatX = _width - stairMargin - 5;
+        int eastHallX = eastThroatX - hw + 1;
 
-        int minEastY = Mathf.Max(margin, ringOuter.yMin + 1);
-        int maxEastY = Mathf.Min(_height - margin - hw, ringOuter.yMax - hw - 1);
-        int eastY = rng.Next(minEastY, maxEastY + 1);
-        CarveLCorridor(
-            new Vector2Int(_width - 10 - hw, eastY),
-            new Vector2Int(ringOuter.xMax - hw, eastY),
-            hw,
-            false);
+        int crossY = (_height - hw) / 2;
 
-        int minSouthX = Mathf.Max(margin, ringOuter.xMin + 1);
-        int maxSouthX = Mathf.Min(_width - margin - hw, ringOuter.xMax - hw - 1);
-        int southX = rng.Next(minSouthX, maxSouthX + 1);
-        CarveLCorridor(
-            new Vector2Int(southX, 10),
-            new Vector2Int(southX, ringOuter.yMin),
-            hw,
-            true);
+        int flankYMin = margin;
+        int flankYMax = _height - margin;
 
-        int minWestY = Mathf.Max(margin, ringOuter.yMin + 1);
-        int maxWestY = Mathf.Min(_height - margin - hw, ringOuter.yMax - hw - 1);
-        int westY = rng.Next(minWestY, maxWestY + 1);
-        CarveLCorridor(
-            new Vector2Int(10, westY),
-            new Vector2Int(ringOuter.xMin, westY),
-            hw,
-            false);
+        // 1. Carve West & East flanking hallways connecting stairwells
+        for (int y = flankYMin; y < flankYMax; y++)
+        {
+            for (int w = 0; w < hw; w++)
+            {
+                _grid[westThroatX + w, y] = CellType.HallwayFloor;
+                _grid[eastHallX + w, y]   = CellType.HallwayFloor;
+            }
+        }
+
+        // 2. East-West cross corridor
+        for (int x = westThroatX; x <= eastHallX + hw - 1; x++)
+        {
+            for (int w = 0; w < hw; w++)
+            {
+                _grid[x, crossY + w] = CellType.HallwayFloor;
+            }
+        }
+
+        // 3. Central North-South arterial spine
+        int spineX = (_width - hw) / 2;
+        for (int y = flankYMin; y < flankYMax; y++)
+        {
+            for (int w = 0; w < hw; w++)
+            {
+                _grid[spineX + w, y] = CellType.HallwayFloor;
+            }
+        }
     }
 
     private void ReserveEntranceVestibule(int startX, int startY, int w, int h, int margin)
@@ -1441,94 +1438,26 @@ public class FactoryMapGenerator : NetworkBehaviour
     // ──────────────── BSP Room Placement ─────────────────────────────────
 
     /// <summary>
-    /// Replaces random-coordinate room placement with BSP (Binary Space Partitioning).
-    /// Subdivides the factory floor into 8 zones around the central ring hallway,
-    /// recursively partitions each zone into non-overlapping rectangular leaves, then
-    /// places rooms sized to each leaf's dimensions — guaranteeing that Auditoriums and
-    /// Workshops always receive appropriately sized space without retry failures.
+    /// Procedurally places rooms across the ENTIRE building interior using BSP.
+    /// No fixed central hub or ring hallway — the full footprint is subdivided.
+    /// On the objective floor the largest qualifying leaf is elected as the Objective Room
+    /// and carved as <see cref="CellType.ObjectiveRoomFloor"/> with 4 cardinal doorways.
     /// </summary>
-    private void CarveInteriorRoomsViaBsp(System.Random rng)
+    private void CarveInteriorRoomsViaBsp(System.Random rng, bool isObjectiveFloor)
     {
         int targetRooms = _config != null ? _config.TargetRoomCount : 15;
-        RectInt ring = _currentFloor.RingOuterBounds;
 
-        // ── Define 8 non-overlapping zones tiling the building interior around the ring ──
-        //
-        //   +------+--------+------+
-        //   |  NW  |   N    |  NE  |
-        //   +------+--------+------+
-        //   |  W   | [RING] |  E   |
-        //   +------+--------+------+
-        //   |  SW  |   S    |  SE  |
-        //   +------+--------+------+
-        //
-        var zones = new List<RectInt>(8);
-        int bMinX = 2, bMinY = 2;
-        int bMaxX = _width - 2, bMaxY = _height - 2;
-
-        // 4 corner quadrants
-        AddBspZoneIfViable(zones, bMinX,     ring.yMax, ring.xMin - bMinX, bMaxY - ring.yMax); // NW
-        AddBspZoneIfViable(zones, ring.xMax, ring.yMax, bMaxX - ring.xMax, bMaxY - ring.yMax); // NE
-        AddBspZoneIfViable(zones, bMinX,     bMinY,     ring.xMin - bMinX, ring.yMin - bMinY); // SW
-        AddBspZoneIfViable(zones, ring.xMax, bMinY,     bMaxX - ring.xMax, ring.yMin - bMinY); // SE
-
-        // 4 strip zones (between ring outer edge and building perimeter)
-        AddBspZoneIfViable(zones, ring.xMin, ring.yMax, ring.width,        bMaxY - ring.yMax); // N
-        AddBspZoneIfViable(zones, ring.xMin, bMinY,     ring.width,        ring.yMin - bMinY); // S
-        AddBspZoneIfViable(zones, ring.xMax, ring.yMin, bMaxX - ring.xMax, ring.height);       // E
-        AddBspZoneIfViable(zones, bMinX,     ring.yMin, ring.xMin - bMinX, ring.height);       // W
-
-        // Shuffle the 4 corner zones among themselves and 4 strip zones among themselves,
-        // then order corners first. Corner zones have no perimeter entrance corridors carving
-        // through them, guaranteeing pure unbisected space for Auditoriums and Workshops.
-        int[] cornerZones = new int[] { 0, 1, 2, 3 };
-        int[] stripZones = new int[] { 4, 5, 6, 7 };
-        for (int k = 3; k > 0; k--)
-        {
-            int swap = rng.Next(k + 1);
-            int tmp = cornerZones[k]; cornerZones[k] = cornerZones[swap]; cornerZones[swap] = tmp;
-        }
-        for (int k = 3; k > 0; k--)
-        {
-            int swap = rng.Next(k + 1);
-            int tmp = stripZones[k]; stripZones[k] = stripZones[swap]; stripZones[swap] = tmp;
-        }
-        int[] zoneOrder = new int[] {
-            cornerZones[0], cornerZones[1], cornerZones[2], cornerZones[3],
-            stripZones[0], stripZones[1], stripZones[2], stripZones[3]
-        };
-
-        // To satisfy GDD Section 5 (1–2 Auditoriums, 2–3 Workshops, Standard Rooms, Closets):
-        // Corner zones 0 and 1 are kept unsplit (depth 0) to guarantee space for Auditoriums.
-        // Corner zones 2 and 3 are split once (depth 1) to guarantee large partitions for Workshops.
-        // The remaining strip zones are subdivided (depth 4) into Standard Rooms and Closets.
-        int targetAuditoriums = 2; // Up to 2 Auditoriums per floor
-        int targetWorkshops = 3;   // Up to 3 Large Workshops per floor
+        // ── Single BSP tree across the entire passable interior ──
+        //    A small perimeter margin (2 tiles) protects the outer concrete skin.
+        //    Entrance vestibule zones are marked in _entranceProtectedZone and rooms
+        //    that overlap them will be rejected by IsRegionPureWall().
+        var fullInterior = new RectInt(2, 2, _width - 4, _height - 4);
+        BspNode rootTree = BuildBspTree(fullInterior, rng, 0, BspMaxDepth);
 
         var allLeaves = new List<BspNode>(64);
-        for (int i = 0; i < zones.Count; i++)
-        {
-            int zoneIdx = zoneOrder[i];
-            int maxDepth;
-            if (i < 2)
-            {
-                maxDepth = 0; // Unsplit corner: guarantees space for Auditoriums
-            }
-            else if (i < 4)
-            {
-                maxDepth = 1; // Split once: guarantees large partitions for Large Workshops
-            }
-            else
-            {
-                maxDepth = 4; // Subdivide into smaller partitions for Standard Rooms and Closets
-            }
+        CollectBspLeaves(rootTree, allLeaves);
 
-            BspNode tree = BuildBspTree(zones[zoneIdx], rng, 0, maxDepth);
-            CollectBspLeaves(tree, allLeaves);
-        }
-
-        // Sort leaves by area descending so the largest partitions (Auditoriums, Workshops)
-        // get first priority for room placement
+        // Sort by area descending — largest leaves get first pick
         allLeaves.Sort((a, b) =>
         {
             int areaA = a.Bounds.width * a.Bounds.height;
@@ -1536,11 +1465,92 @@ public class FactoryMapGenerator : NetworkBehaviour
             return areaB.CompareTo(areaA);
         });
 
-        // ── Place rooms in BSP leaves until we reach the target count ──
+        // ── Elect the Objective Room from the largest qualifying leaf on this floor ──
+        bool objectivePlaced = false;
+        if (isObjectiveFloor)
+        {
+            int targetObjSize = _config != null ? _config.ObjectiveRoomSize : 24;
+            int objMinDim = _config != null ? Mathf.Max(16, targetObjSize - 4) : 16;
+
+            for (int minDim = objMinDim; minDim >= 10 && !objectivePlaced; minDim -= 2)
+            {
+                for (int i = 0; i < allLeaves.Count; i++)
+                {
+                    BspNode leaf = allLeaves[i];
+                    int availW = leaf.Bounds.width - 2;
+                    int availH = leaf.Bounds.height - 2;
+                    if (availW < minDim || availH < minDim) continue;
+
+                    // Try to place the objective room in the interior of this leaf
+                    int rw = Mathf.Clamp(targetObjSize + rng.Next(-2, 3), minDim, availW);
+                    int rh = Mathf.Clamp(targetObjSize + rng.Next(-2, 3), minDim, availH);
+
+                    int maxOffX = Mathf.Max(0, availW - rw);
+                    int maxOffY = Mathf.Max(0, availH - rh);
+                    int offX = maxOffX > 0 ? rng.Next(0, maxOffX + 1) : 0;
+                    int offY = maxOffY > 0 ? rng.Next(0, maxOffY + 1) : 0;
+                    int rx = leaf.Bounds.xMin + 1 + offX;
+                    int ry = leaf.Bounds.yMin + 1 + offY;
+
+                    if (!IsRegionPureWall(rx - 1, ry - 1, rw + 2, rh + 2)) continue;
+
+                    // Carve objective room floor
+                    for (int x = rx; x < rx + rw; x++)
+                        for (int y = ry; y < ry + rh; y++)
+                            _grid[x, y] = CellType.ObjectiveRoomFloor;
+
+                    var objBounds = new RectInt(rx, ry, rw, rh);
+                    _objectiveRoomBounds = objBounds;
+                    _currentFloor.CentralRoomBounds = objBounds;
+
+                    // Connect doorways outward toward the surrounding arterial corridors
+                    int connectedDoorways = 0;
+                    for (int side = 0; side < 4; side++)
+                    {
+                        if (TryConnectRoomWallOutward(objBounds, side))
+                            connectedDoorways++;
+                    }
+
+                    // If outward rays didn't hit a hallway, ensure 4 cardinal doorways are carved
+                    if (connectedDoorways == 0)
+                    {
+                        int doorSpan = GetDoorwaySpan();
+                        int midX = rx + (rw - doorSpan) / 2;
+                        int midY = ry + (rh - doorSpan) / 2;
+                        CarveHorizontalDoorway(midX, ry + rh, doorSpan);
+                        CarveHorizontalDoorway(midX, ry - 1, doorSpan);
+                        CarveVerticalDoorway(rx + rw, midY, doorSpan);
+                        CarveVerticalDoorway(rx - 1, midY, doorSpan);
+                        connectedDoorways = 4;
+                    }
+
+                    GetArchetypeDoorAndWindowTargets(RoomArchetype.Auditorium, rng, out int td, out int tw);
+                    _rooms.Add(new RoomData
+                    {
+                        FloorLevel = _currentFloor.FloorLevel,
+                        Bounds     = objBounds,
+                        Archetype  = RoomArchetype.ObjectiveHub,
+                        IsObjectiveRoom = true,
+                        TargetDoorways  = Mathf.Max(connectedDoorways, td),
+                        ActualDoorways  = connectedDoorways,
+                        TargetWindows   = tw
+                    });
+
+                    // Remove leaf from pool so it isn't double-used
+                    allLeaves.RemoveAt(i);
+                    objectivePlaced = true;
+                    break;
+                }
+            }
+        }
+
+        // ── Place ordinary rooms in remaining leaves ──
+        int targetAuditoriums = 2;
+        int targetWorkshops   = 3;
         int targetFromBsp = Mathf.Max(0, targetRooms - _rooms.Count);
-        int placed = 0;
+        int placed            = 0;
         int placedAuditoriums = 0;
-        int placedWorkshops = 0;
+        int placedWorkshops   = 0;
         for (int i = 0; i < allLeaves.Count && placed < targetFromBsp; i++)
         {
             if (TryPlaceRoomInBspLeaf(allLeaves[i], rng, targetAuditoriums, ref placedAuditoriums, targetWorkshops, ref placedWorkshops))
@@ -1602,14 +1612,6 @@ public class FactoryMapGenerator : NetworkBehaviour
         }
     }
 
-    /// <summary>Adds a zone to the list only if both dimensions meet the minimum BSP leaf size.</summary>
-    private static void AddBspZoneIfViable(List<RectInt> zones, int x, int y, int w, int h)
-    {
-        if (w >= BspMinLeafDim && h >= BspMinLeafDim)
-        {
-            zones.Add(new RectInt(x, y, w, h));
-        }
-    }
 
     /// <summary>
     /// Recursively subdivides a rectangular region into a binary tree of sub-partitions.
@@ -1906,10 +1908,10 @@ public class FactoryMapGenerator : NetworkBehaviour
 
     private void ConnectRoomsWithSecondaryHallwaysAndDoors(System.Random rng, RectInt ringOuter)
     {
-        for (int i = 1; i < _rooms.Count; i++)
+        for (int i = 0; i < _rooms.Count; i++)
         {
             RoomData room = _rooms[i];
-            if (room.TargetDoorways <= 1) continue;
+            if (room.IsObjectiveRoom || room.TargetDoorways <= 1) continue;
 
             RectInt bounds = room.Bounds;
             int[] wallOrder = { 0, 1, 2, 3 };
@@ -1928,9 +1930,11 @@ public class FactoryMapGenerator : NetworkBehaviour
             }
         }
 
-        for (int i = 1; i < _rooms.Count; i++)
+        for (int i = 0; i < _rooms.Count; i++)
         {
             RoomData room = _rooms[i];
+            if (room.IsObjectiveRoom) continue;
+
             int minRequired = room.Archetype switch
             {
                 RoomArchetype.Auditorium => 3,
@@ -1941,7 +1945,7 @@ public class FactoryMapGenerator : NetworkBehaviour
             int safety = 0;
             while (GetRoomDoorwayWallCount(room.Bounds) < minRequired && safety < 3)
             {
-                ForceSecondHallwayEntranceForRoom(room.Bounds, ringOuter);
+                ForceSecondHallwayEntranceForRoom(room.Bounds);
                 safety++;
             }
         }
@@ -2321,7 +2325,7 @@ public class FactoryMapGenerator : NetworkBehaviour
         return true;
     }
 
-    private void ForceSecondHallwayEntranceForRoom(RectInt room, RectInt ringOuter)
+    private void ForceSecondHallwayEntranceForRoom(RectInt room)
     {
         int hw = GetConfiguredHallwayWidth();
         int doorSpan = (room.width <= 8 || room.height <= 8) ? 2 : GetDoorwaySpan();
@@ -2351,11 +2355,15 @@ public class FactoryMapGenerator : NetworkBehaviour
             int side = candidateSides[i];
             if (DoesRoomWallHaveDoorway(room, side)) continue;
 
+            // Prioritize connecting to an existing hallway ray
+            if (TryConnectRoomWallOutward(room, side)) return;
+
+            // Otherwise carve toward the interior
             if (side == 0 && room.yMax + hw + 1 < _height - 1)
             {
                 CarveHorizontalDoorway(doorX, room.yMax, doorSpan);
                 var from = new Vector2Int(hallStartX, room.yMax + 1);
-                var to = new Vector2Int(Mathf.Clamp(hallStartX, ringOuter.xMin, ringOuter.xMax - hw), ringOuter.yMax - hw);
+                var to = new Vector2Int(hallStartX, Mathf.Min(_height - hw - 2, room.yMax + 1 + hw * 2));
                 CarveLCorridor(from, to, hw, true);
                 return;
             }
@@ -2363,7 +2371,7 @@ public class FactoryMapGenerator : NetworkBehaviour
             {
                 CarveHorizontalDoorway(doorX, room.yMin - 1, doorSpan);
                 var from = new Vector2Int(hallStartX, room.yMin - 1 - hw);
-                var to = new Vector2Int(Mathf.Clamp(hallStartX, ringOuter.xMin, ringOuter.xMax - hw), ringOuter.yMin);
+                var to = new Vector2Int(hallStartX, Mathf.Max(2, room.yMin - 1 - hw * 3));
                 CarveLCorridor(from, to, hw, true);
                 return;
             }
@@ -2371,7 +2379,7 @@ public class FactoryMapGenerator : NetworkBehaviour
             {
                 CarveVerticalDoorway(room.xMax, doorY, doorSpan);
                 var from = new Vector2Int(room.xMax + 1, hallStartY);
-                var to = new Vector2Int(ringOuter.xMax - hw, Mathf.Clamp(hallStartY, ringOuter.yMin, ringOuter.yMax - hw));
+                var to = new Vector2Int(Mathf.Min(_width - hw - 2, room.xMax + 1 + hw * 2), hallStartY);
                 CarveLCorridor(from, to, hw, false);
                 return;
             }
@@ -2379,7 +2387,7 @@ public class FactoryMapGenerator : NetworkBehaviour
             {
                 CarveVerticalDoorway(room.xMin - 1, doorY, doorSpan);
                 var from = new Vector2Int(room.xMin - 1 - hw, hallStartY);
-                var to = new Vector2Int(ringOuter.xMin, Mathf.Clamp(hallStartY, ringOuter.yMin, ringOuter.yMax - hw));
+                var to = new Vector2Int(Mathf.Max(2, room.xMin - 1 - hw * 3), hallStartY);
                 CarveLCorridor(from, to, hw, false);
                 return;
             }
@@ -3343,31 +3351,77 @@ public class FactoryMapGenerator : NetworkBehaviour
         }
     }
 
-    private void EnsureAllEntrancesConnectedViaBfs(RectInt ringOuter, int hw)
+    private void EnsureAllEntrancesConnectedViaBfs(RectInt interiorBounds, int hw)
     {
-        bool[,] reachable = ComputeReachableFromCentralRoom();
+        bool[,] reachable = ComputeReachableFloor();
+
+        // Find a reachable interior anchor to carve L-corridors toward when an entrance is isolated.
+        // Prefer a point near the objective room or the largest room; fall back to interior midpoint.
+        int anchorX = interiorBounds.xMin + interiorBounds.width  / 2;
+        int anchorY = interiorBounds.yMin + interiorBounds.height / 2;
+        if (_currentFloor.CentralRoomBounds.width > 0)
+        {
+            anchorX = _currentFloor.CentralRoomBounds.xMin + _currentFloor.CentralRoomBounds.width  / 2;
+            anchorY = _currentFloor.CentralRoomBounds.yMin + _currentFloor.CentralRoomBounds.height / 2;
+        }
 
         for (int e = 0; e < 4; e++)
         {
             Vector2Int entCell = _entrances[e].GridCell;
             if (!reachable[entCell.x, entCell.y])
             {
-                Vector2Int ringTarget = new Vector2Int(
-                    Mathf.Clamp(entCell.x, ringOuter.xMin, ringOuter.xMax - hw),
-                    Mathf.Clamp(entCell.y, ringOuter.yMin, ringOuter.yMax - hw));
-                CarveLCorridor(entCell, ringTarget, hw, _entrances[e].WallSide == 0 || _entrances[e].WallSide == 2);
+                Vector2Int interiorTarget = new Vector2Int(
+                    Mathf.Clamp(anchorX, interiorBounds.xMin, interiorBounds.xMax - hw),
+                    Mathf.Clamp(anchorY, interiorBounds.yMin, interiorBounds.yMax - hw));
+                CarveLCorridor(entCell, interiorTarget, hw, _entrances[e].WallSide == 0 || _entrances[e].WallSide == 2);
             }
         }
     }
 
-    private bool[,] ComputeReachableFromCentralRoom()
+    /// <summary>
+    /// BFS from the dynamic Objective Room (or the largest room on this floor if no objective room
+    /// has been placed yet). Seeds connectivity verification for all 4 perimeter entrances.
+    /// </summary>
+    private bool[,] ComputeReachableFloor()
     {
         bool[,] visited = new bool[_width, _height];
         var queue = new Queue<Vector2Int>();
 
-        RectInt central = _currentFloor.CentralRoomBounds;
-        int startX = central.xMin + central.width / 2;
-        int startY = central.yMin + central.height / 2;
+        // Seed from the objective room center; fall back to the CentralRoomBounds if needed
+        RectInt seedBounds = (_objectiveRoomBounds.width > 0)
+            ? _objectiveRoomBounds
+            : _currentFloor.CentralRoomBounds;
+
+        // If still zero (floor has no objective room), seed from the first room we can find
+        if (seedBounds.width <= 0 && _rooms.Count > 0)
+        {
+            seedBounds = _rooms[0].Bounds;
+        }
+
+        int startX = Mathf.Clamp(seedBounds.xMin + seedBounds.width / 2, 1, _width - 2);
+        int startY = Mathf.Clamp(seedBounds.yMin + seedBounds.height / 2, 1, _height - 2);
+
+        // Walk inward until we land on a walkable tile
+        bool found = false;
+        for (int r = 0; r <= Mathf.Max(_width, _height) / 2 && !found; r++)
+        {
+            for (int dx2 = -r; dx2 <= r && !found; dx2++)
+            {
+                for (int dy2 = -r; dy2 <= r && !found; dy2++)
+                {
+                    int tx = startX + dx2;
+                    int ty = startY + dy2;
+                    if (tx < 0 || tx >= _width || ty < 0 || ty >= _height) continue;
+                    if (IsWalkableFloorOrDoorway(tx, ty))
+                    {
+                        startX = tx;
+                        startY = ty;
+                        found = true;
+                    }
+                }
+            }
+        }
+
         var start = new Vector2Int(startX, startY);
         visited[start.x, start.y] = true;
         queue.Enqueue(start);
@@ -3716,9 +3770,13 @@ public class FactoryMapGenerator : NetworkBehaviour
             state = _floorStates[0];
         }
 
+        // Derive a preferred position near the objective/largest room rather than a fixed center
         int hw = GetConfiguredHallwayWidth();
-        int preferredX = state.CentralRoomBounds.xMin + state.CentralRoomBounds.width / 2;
-        int preferredY = state.CentralRoomBounds.yMax + 1 + (hw / 2);
+        RectInt hub = state.CentralRoomBounds.width > 0
+            ? state.CentralRoomBounds
+            : new RectInt(_width / 2 - 4, _height / 2 - 4, 8, 8);
+        int preferredX = hub.xMin + hub.width / 2;
+        int preferredY = Mathf.Clamp(hub.yMax + 1 + hw / 2, 4, _height - 4);
 
         for (int y = 4; y < _height - 4; y++)
         {
@@ -3930,10 +3988,10 @@ public class FactoryMapGenerator : NetworkBehaviour
             ? $" (Stairs: {Mathf.RoundToInt(CurrentStairClimbProgress * 100f)}%)"
             : string.Empty;
 
-        GUILayout.BeginArea(new Rect(10f, 48f, 520f, 64f));
+        GUILayout.BeginArea(new Rect(10f, 48f, 580f, 86f));
         GUILayout.BeginVertical("box");
         GUILayout.BeginHorizontal();
-        GUILayout.Label($"Seed: {MapSeed} | Floors ({_activeFloors.Count}): {floorsDesc}");
+        GUILayout.Label($"Seed: {MapSeed} | Map: {_width}×{_height} | Floors ({_activeFloors.Count}): {floorsDesc}");
         if (GUILayout.Button("New Map Seed", GUILayout.Width(110f), GUILayout.Height(22f)))
         {
             RequestNewRandomMap();
@@ -3942,7 +4000,7 @@ public class FactoryMapGenerator : NetworkBehaviour
         GUILayout.Label(
             $"Current: {GetFloorDisplayName(CurrentLocalFloorLevel)}{stairStatus} | " +
             $"Objective: {GetFloorDisplayName(_objectiveFloorLevel)} | " +
-            $"Staircases: {_spawnedStairwells.Count}");
+            $"Rooms: {TotalGeneratedRoomCount} | Staircases: {_spawnedStairwells.Count}");
         GUILayout.EndVertical();
         GUILayout.EndArea();
     }

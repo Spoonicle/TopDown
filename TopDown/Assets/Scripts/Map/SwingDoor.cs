@@ -228,7 +228,7 @@ public class SwingDoor : MonoBehaviour
             // Push the door away from the side the player or weapon barrel is on
             float pushDirection = sideDist >= 0f ? -1f : 1f;
             float leverage = alongDoor / _doorLength;
-            float basePushSpeed = isWeaponBarrel ? 280f : 340f;
+            float basePushSpeed = isWeaponBarrel ? 140f : 180f;
 
             _angularVelocity = pushDirection * basePushSpeed * Mathf.Max(0.45f, leverage);
         }

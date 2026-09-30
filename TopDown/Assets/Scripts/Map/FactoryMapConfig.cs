@@ -57,7 +57,7 @@ public class FactoryMapConfig : ScriptableObject
 
     [Tooltip("Target total number of rooms inside the factory building (including the Objective Room).")]
     [Range(5, 30)]
-    [SerializeField] private int _targetRoomCount = 15;
+    [SerializeField] private int _targetRoomCount = 18;
 
     [Tooltip("Minimum interior room width/height in tiles.")]
     [Range(4, 24)]

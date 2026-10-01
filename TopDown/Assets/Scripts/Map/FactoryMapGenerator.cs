@@ -776,16 +776,30 @@ public class FactoryMapGenerator : NetworkBehaviour
 
         if (_mapRoot != null)
         {
-            _mapRoot.name = "DestroyedFactoryMap";
-            _mapRoot.SetActive(false);
-            Destroy(_mapRoot);
+            if (Application.isPlaying)
+            {
+                _mapRoot.name = "DestroyedFactoryMap";
+                _mapRoot.SetActive(false);
+                Destroy(_mapRoot);
+            }
+            else
+            {
+                DestroyImmediate(_mapRoot);
+            }
         }
         var existingRoot = GameObject.Find("GeneratedFactoryMap");
         if (existingRoot != null)
         {
-            existingRoot.name = "DestroyedFactoryMap";
-            existingRoot.SetActive(false);
-            Destroy(existingRoot);
+            if (Application.isPlaying)
+            {
+                existingRoot.name = "DestroyedFactoryMap";
+                existingRoot.SetActive(false);
+                Destroy(existingRoot);
+            }
+            else
+            {
+                DestroyImmediate(existingRoot);
+            }
         }
         _mapRoot = new GameObject("GeneratedFactoryMap");
 
@@ -3132,22 +3146,23 @@ public class FactoryMapGenerator : NetworkBehaviour
 
     private bool TryConnectRoomWallOutward(RectInt room, int wallSide)
     {
-        // Always keep hallways at full configured width (>= 1.5x player body), never narrower!
         int hw = GetConfiguredHallwayWidth();
         int doorSpan = (room.width <= 8 || room.height <= 8) ? 3 : GetDoorwaySpan();
-        if (room.width - 2 < doorSpan || room.height - 2 < doorSpan) return false;
+        if (room.width < doorSpan + 4 || room.height < doorSpan + 4) return false;
 
-        int marginX = (room.width >= doorSpan + 4) ? 2 : 1;
-        int marginY = (room.height >= doorSpan + 4) ? 2 : 1;
-        int doorX = Mathf.Clamp(room.xMin + (room.width - doorSpan) / 2, room.xMin + marginX, room.xMax - doorSpan - marginX);
-        int doorY = Mathf.Clamp(room.yMin + (room.height - doorSpan) / 2, room.yMin + marginY, room.yMax - doorSpan - marginY);
+        const int margin = 2;
+        int doorX = Mathf.Clamp(room.xMin + (room.width - doorSpan) / 2, room.xMin + margin, room.xMax - doorSpan - margin);
+        int doorY = Mathf.Clamp(room.yMin + (room.height - doorSpan) / 2, room.yMin + margin, room.yMax - doorSpan - margin);
         int hallStartX = Mathf.Clamp(doorX - (hw - doorSpan) / 2, 2, _width - hw - 2);
         int hallStartY = Mathf.Clamp(doorY - (hw - doorSpan) / 2, 2, _height - hw - 2);
         const int maxDist = 36;
 
-        if (wallSide == 0)
+        if (wallSide == 0) // North
         {
-            if (doorX + doorSpan >= _width - 2) return false;
+            if (doorX + doorSpan >= _width - 2 || room.yMax >= _height - 2) return false;
+            if (!HasWallContinuity(doorX - 1, room.yMax, doorX, room.yMax, doorSpan, true) ||
+                !HasWallContinuity(doorX + doorSpan, room.yMax, doorX, room.yMax, doorSpan, true)) return false;
+
             for (int dist = 1; dist <= maxDist; dist++)
             {
                 int cy = room.yMax + dist;
@@ -3155,6 +3170,8 @@ public class FactoryMapGenerator : NetworkBehaviour
 
                 if (SpanMatchesCellType(doorX, cy, doorSpan, true, CellType.HallwayFloor))
                 {
+                    if (dist > 1 && !IsRegionPureWall(hallStartX, room.yMax + 1, hw, dist - 1)) break;
+
                     for (int y = room.yMax + 1; y < cy; y++)
                         for (int w = 0; w < hw; w++)
                             SetHallwayIfWall(hallStartX + w, y);
@@ -3165,26 +3182,24 @@ public class FactoryMapGenerator : NetworkBehaviour
 
                 if (SpanMatchesRoomFloor(doorX, cy, doorSpan, true))
                 {
-                    if (dist == 1)
+                    // Direct shared wall between two adjacent rooms: single doorway only
+                    if (dist == 1 && !DoesRoomWallHaveDoorway(room, 0))
                     {
                         CarveHorizontalDoorway(doorX, room.yMax, doorSpan);
+                        return true;
                     }
-                    else
-                    {
-                        for (int y = room.yMax + 1; y <= cy - 2; y++)
-                            for (int w = 0; w < hw; w++)
-                                SetHallwayIfWall(hallStartX + w, y);
-
-                        CarveHorizontalDoorway(doorX, room.yMax, doorSpan);
-                        CarveHorizontalDoorway(doorX, cy - 1, doorSpan);
-                    }
-                    return true;
+                    break;
                 }
+
+                if (!SpanMatchesCellType(doorX, cy, doorSpan, true, CellType.Wall)) break;
             }
         }
-        else if (wallSide == 2)
+        else if (wallSide == 2) // South
         {
-            if (doorX + doorSpan >= _width - 2) return false;
+            if (doorX + doorSpan >= _width - 2 || room.yMin - 1 <= 1) return false;
+            if (!HasWallContinuity(doorX - 1, room.yMin - 1, doorX, room.yMin - 1, doorSpan, true) ||
+                !HasWallContinuity(doorX + doorSpan, room.yMin - 1, doorX, room.yMin - 1, doorSpan, true)) return false;
+
             for (int dist = 1; dist <= maxDist; dist++)
             {
                 int cy = room.yMin - 1 - dist;
@@ -3192,6 +3207,8 @@ public class FactoryMapGenerator : NetworkBehaviour
 
                 if (SpanMatchesCellType(doorX, cy, doorSpan, true, CellType.HallwayFloor))
                 {
+                    if (dist > 1 && !IsRegionPureWall(hallStartX, cy + 1, hw, dist - 1)) break;
+
                     for (int y = cy + 1; y <= room.yMin - 2; y++)
                         for (int w = 0; w < hw; w++)
                             SetHallwayIfWall(hallStartX + w, y);
@@ -3202,26 +3219,23 @@ public class FactoryMapGenerator : NetworkBehaviour
 
                 if (SpanMatchesRoomFloor(doorX, cy, doorSpan, true))
                 {
-                    if (dist == 1)
+                    if (dist == 1 && !DoesRoomWallHaveDoorway(room, 2))
                     {
                         CarveHorizontalDoorway(doorX, room.yMin - 1, doorSpan);
+                        return true;
                     }
-                    else
-                    {
-                        for (int y = cy + 2; y <= room.yMin - 2; y++)
-                            for (int w = 0; w < hw; w++)
-                                SetHallwayIfWall(hallStartX + w, y);
-
-                        CarveHorizontalDoorway(doorX, room.yMin - 1, doorSpan);
-                        CarveHorizontalDoorway(doorX, cy + 1, doorSpan);
-                    }
-                    return true;
+                    break;
                 }
+
+                if (!SpanMatchesCellType(doorX, cy, doorSpan, true, CellType.Wall)) break;
             }
         }
-        else if (wallSide == 1)
+        else if (wallSide == 1) // East
         {
-            if (doorY + doorSpan >= _height - 2) return false;
+            if (doorY + doorSpan >= _height - 2 || room.xMax >= _width - 2) return false;
+            if (!HasWallContinuity(room.xMax, doorY - 1, room.xMax, doorY, doorSpan, false) ||
+                !HasWallContinuity(room.xMax, doorY + doorSpan, room.xMax, doorY, doorSpan, false)) return false;
+
             for (int dist = 1; dist <= maxDist; dist++)
             {
                 int cx = room.xMax + dist;
@@ -3229,6 +3243,8 @@ public class FactoryMapGenerator : NetworkBehaviour
 
                 if (SpanMatchesCellType(cx, doorY, doorSpan, false, CellType.HallwayFloor))
                 {
+                    if (dist > 1 && !IsRegionPureWall(room.xMax + 1, hallStartY, dist - 1, hw)) break;
+
                     for (int x = room.xMax + 1; x < cx; x++)
                         for (int w = 0; w < hw; w++)
                             SetHallwayIfWall(x, hallStartY + w);
@@ -3239,26 +3255,23 @@ public class FactoryMapGenerator : NetworkBehaviour
 
                 if (SpanMatchesRoomFloor(cx, doorY, doorSpan, false))
                 {
-                    if (dist == 1)
+                    if (dist == 1 && !DoesRoomWallHaveDoorway(room, 1))
                     {
                         CarveVerticalDoorway(room.xMax, doorY, doorSpan);
+                        return true;
                     }
-                    else
-                    {
-                        for (int x = room.xMax + 1; x <= cx - 2; x++)
-                            for (int w = 0; w < hw; w++)
-                                SetHallwayIfWall(x, hallStartY + w);
-
-                        CarveVerticalDoorway(room.xMax, doorY, doorSpan);
-                        CarveVerticalDoorway(cx - 1, doorY, doorSpan);
-                    }
-                    return true;
+                    break;
                 }
+
+                if (!SpanMatchesCellType(cx, doorY, doorSpan, false, CellType.Wall)) break;
             }
         }
-        else if (wallSide == 3)
+        else if (wallSide == 3) // West
         {
-            if (doorY + doorSpan >= _height - 2) return false;
+            if (doorY + doorSpan >= _height - 2 || room.xMin - 1 <= 1) return false;
+            if (!HasWallContinuity(room.xMin - 1, doorY - 1, room.xMin - 1, doorY, doorSpan, false) ||
+                !HasWallContinuity(room.xMin - 1, doorY + doorSpan, room.xMin - 1, doorY, doorSpan, false)) return false;
+
             for (int dist = 1; dist <= maxDist; dist++)
             {
                 int cx = room.xMin - 1 - dist;
@@ -3266,6 +3279,8 @@ public class FactoryMapGenerator : NetworkBehaviour
 
                 if (SpanMatchesCellType(cx, doorY, doorSpan, false, CellType.HallwayFloor))
                 {
+                    if (dist > 1 && !IsRegionPureWall(cx + 1, hallStartY, dist - 1, hw)) break;
+
                     for (int x = cx + 1; x <= room.xMin - 2; x++)
                         for (int w = 0; w < hw; w++)
                             SetHallwayIfWall(x, hallStartY + w);
@@ -3276,21 +3291,15 @@ public class FactoryMapGenerator : NetworkBehaviour
 
                 if (SpanMatchesRoomFloor(cx, doorY, doorSpan, false))
                 {
-                    if (dist == 1)
+                    if (dist == 1 && !DoesRoomWallHaveDoorway(room, 3))
                     {
                         CarveVerticalDoorway(room.xMin - 1, doorY, doorSpan);
+                        return true;
                     }
-                    else
-                    {
-                        for (int x = cx + 2; x <= room.xMin - 2; x++)
-                            for (int w = 0; w < hw; w++)
-                                SetHallwayIfWall(x, hallStartY + w);
-
-                        CarveVerticalDoorway(room.xMin - 1, doorY, doorSpan);
-                        CarveVerticalDoorway(cx + 1, doorY, doorSpan);
-                    }
-                    return true;
+                    break;
                 }
+
+                if (!SpanMatchesCellType(cx, doorY, doorSpan, false, CellType.Wall)) break;
             }
         }
 
@@ -3324,16 +3333,6 @@ public class FactoryMapGenerator : NetworkBehaviour
 
     private void ForceSecondHallwayEntranceForRoom(RectInt room)
     {
-        int hw = GetConfiguredHallwayWidth();
-        int doorSpan = (room.width <= 8 || room.height <= 8) ? 2 : GetDoorwaySpan();
-
-        int marginX = (room.width >= doorSpan + 4) ? 2 : 1;
-        int marginY = (room.height >= doorSpan + 4) ? 2 : 1;
-        int doorX = Mathf.Clamp(room.xMin + (room.width - doorSpan) / 2, room.xMin + marginX, room.xMax - doorSpan - marginX);
-        int doorY = Mathf.Clamp(room.yMin + (room.height - doorSpan) / 2, room.yMin + marginY, room.yMax - doorSpan - marginY);
-        int hallStartX = Mathf.Clamp(doorX - (hw - doorSpan) / 2, 2, _width - hw - 2);
-        int hallStartY = Mathf.Clamp(doorY - (hw - doorSpan) / 2, 2, _height - hw - 2);
-
         int centerX = _width / 2;
         int centerY = _height / 2;
         int roomCenterX = room.xMin + room.width / 2;
@@ -3352,42 +3351,7 @@ public class FactoryMapGenerator : NetworkBehaviour
             int side = candidateSides[i];
             if (DoesRoomWallHaveDoorway(room, side)) continue;
 
-            // Prioritize connecting to an existing hallway ray
             if (TryConnectRoomWallOutward(room, side)) return;
-
-            // Otherwise carve toward the interior
-            if (side == 0 && room.yMax + hw + 1 < _height - 1)
-            {
-                CarveHorizontalDoorway(doorX, room.yMax, doorSpan);
-                var from = new Vector2Int(hallStartX, room.yMax + 1);
-                var to = new Vector2Int(hallStartX, Mathf.Min(_height - hw - 2, room.yMax + 1 + hw * 2));
-                CarveLCorridor(from, to, hw, true);
-                return;
-            }
-            if (side == 2 && room.yMin - 1 - hw > 1)
-            {
-                CarveHorizontalDoorway(doorX, room.yMin - 1, doorSpan);
-                var from = new Vector2Int(hallStartX, room.yMin - 1 - hw);
-                var to = new Vector2Int(hallStartX, Mathf.Max(2, room.yMin - 1 - hw * 3));
-                CarveLCorridor(from, to, hw, true);
-                return;
-            }
-            if (side == 1 && room.xMax + hw + 1 < _width - 1)
-            {
-                CarveVerticalDoorway(room.xMax, doorY, doorSpan);
-                var from = new Vector2Int(room.xMax + 1, hallStartY);
-                var to = new Vector2Int(Mathf.Min(_width - hw - 2, room.xMax + 1 + hw * 2), hallStartY);
-                CarveLCorridor(from, to, hw, false);
-                return;
-            }
-            if (side == 3 && room.xMin - 1 - hw > 1)
-            {
-                CarveVerticalDoorway(room.xMin - 1, doorY, doorSpan);
-                var from = new Vector2Int(room.xMin - 1 - hw, hallStartY);
-                var to = new Vector2Int(Mathf.Max(2, room.xMin - 1 - hw * 3), hallStartY);
-                CarveLCorridor(from, to, hw, false);
-                return;
-            }
         }
     }
 
@@ -3601,16 +3565,23 @@ public class FactoryMapGenerator : NetworkBehaviour
             {
                 for (int x = room.xMin + mX; x <= room.xMax - mX - doorSpan; x++)
                 {
-                    bool allHall = true;
+                    bool valid = true;
                     for (int s = 0; s < doorSpan; s++)
                     {
-                        if (_grid[x + s, room.yMax + 1] != CellType.HallwayFloor)
+                        if (_grid[x + s, room.yMax] != CellType.Wall ||
+                            _grid[x + s, room.yMax + 1] != CellType.HallwayFloor ||
+                            (_grid[x + s, room.yMax - 1] != CellType.RoomFloor && _grid[x + s, room.yMax - 1] != CellType.ObjectiveRoomFloor))
                         {
-                            allHall = false;
+                            valid = false;
                             break;
                         }
                     }
-                    if (allHall) candidates.Add((new Vector2Int(x, room.yMax), true));
+                    if (valid &&
+                        HasWallContinuity(x - 1, room.yMax, x, room.yMax, doorSpan, true) &&
+                        HasWallContinuity(x + doorSpan, room.yMax, x, room.yMax, doorSpan, true))
+                    {
+                        candidates.Add((new Vector2Int(x, room.yMax), true));
+                    }
                 }
             }
 
@@ -3618,16 +3589,23 @@ public class FactoryMapGenerator : NetworkBehaviour
             {
                 for (int x = room.xMin + mX; x <= room.xMax - mX - doorSpan; x++)
                 {
-                    bool allHall = true;
+                    bool valid = true;
                     for (int s = 0; s < doorSpan; s++)
                     {
-                        if (_grid[x + s, room.yMin - 2] != CellType.HallwayFloor)
+                        if (_grid[x + s, room.yMin - 1] != CellType.Wall ||
+                            _grid[x + s, room.yMin - 2] != CellType.HallwayFloor ||
+                            (_grid[x + s, room.yMin] != CellType.RoomFloor && _grid[x + s, room.yMin] != CellType.ObjectiveRoomFloor))
                         {
-                            allHall = false;
+                            valid = false;
                             break;
                         }
                     }
-                    if (allHall) candidates.Add((new Vector2Int(x, room.yMin - 1), true));
+                    if (valid &&
+                        HasWallContinuity(x - 1, room.yMin - 1, x, room.yMin - 1, doorSpan, true) &&
+                        HasWallContinuity(x + doorSpan, room.yMin - 1, x, room.yMin - 1, doorSpan, true))
+                    {
+                        candidates.Add((new Vector2Int(x, room.yMin - 1), true));
+                    }
                 }
             }
 
@@ -3635,16 +3613,23 @@ public class FactoryMapGenerator : NetworkBehaviour
             {
                 for (int y = room.yMin + mY; y <= room.yMax - mY - doorSpan; y++)
                 {
-                    bool allHall = true;
+                    bool valid = true;
                     for (int s = 0; s < doorSpan; s++)
                     {
-                        if (_grid[room.xMax + 1, y + s] != CellType.HallwayFloor)
+                        if (_grid[room.xMax, y + s] != CellType.Wall ||
+                            _grid[room.xMax + 1, y + s] != CellType.HallwayFloor ||
+                            (_grid[room.xMax - 1, y + s] != CellType.RoomFloor && _grid[room.xMax - 1, y + s] != CellType.ObjectiveRoomFloor))
                         {
-                            allHall = false;
+                            valid = false;
                             break;
                         }
                     }
-                    if (allHall) candidates.Add((new Vector2Int(room.xMax, y), false));
+                    if (valid &&
+                        HasWallContinuity(room.xMax, y - 1, room.xMax, y, doorSpan, false) &&
+                        HasWallContinuity(room.xMax, y + doorSpan, room.xMax, y, doorSpan, false))
+                    {
+                        candidates.Add((new Vector2Int(room.xMax, y), false));
+                    }
                 }
             }
 
@@ -3652,16 +3637,23 @@ public class FactoryMapGenerator : NetworkBehaviour
             {
                 for (int y = room.yMin + mY; y <= room.yMax - mY - doorSpan; y++)
                 {
-                    bool allHall = true;
+                    bool valid = true;
                     for (int s = 0; s < doorSpan; s++)
                     {
-                        if (_grid[room.xMin - 2, y + s] != CellType.HallwayFloor)
+                        if (_grid[room.xMin - 1, y + s] != CellType.Wall ||
+                            _grid[room.xMin - 2, y + s] != CellType.HallwayFloor ||
+                            (_grid[room.xMin, y + s] != CellType.RoomFloor && _grid[room.xMin, y + s] != CellType.ObjectiveRoomFloor))
                         {
-                            allHall = false;
+                            valid = false;
                             break;
                         }
                     }
-                    if (allHall) candidates.Add((new Vector2Int(room.xMin - 1, y), false));
+                    if (valid &&
+                        HasWallContinuity(room.xMin - 1, y - 1, room.xMin - 1, y, doorSpan, false) &&
+                        HasWallContinuity(room.xMin - 1, y + doorSpan, room.xMin - 1, y, doorSpan, false))
+                    {
+                        candidates.Add((new Vector2Int(room.xMin - 1, y), false));
+                    }
                 }
             }
         }
@@ -3733,10 +3725,79 @@ public class FactoryMapGenerator : NetworkBehaviour
         MarkDoorwayClearanceZone(x - 4, y - 2, 9, doorSpan + 4);
     }
 
+    private bool HasWallContinuity(int wx, int wy, int doorStartX, int doorStartY, int span, bool horizontal)
+    {
+        if (wx < 0 || wx >= _width || wy < 0 || wy >= _height) return false;
+        if (_grid[wx, wy] != CellType.Wall && _grid[wx, wy] != CellType.Window) return false;
+
+        // Perimeter walls always have continuity along building perimeter
+        if (wx == 0 || wx == _width - 1 || wy == 0 || wy == _height - 1) return true;
+
+        int[] cdx = { 0, 0, -1, 1 };
+        int[] cdy = { 1, -1, 0, 0 };
+        for (int d = 0; d < 4; d++)
+        {
+            int nx = wx + cdx[d];
+            int ny = wy + cdy[d];
+            if (nx < 0 || nx >= _width || ny < 0 || ny >= _height) continue;
+            // Exclude the doorway opening itself
+            if (horizontal && ny == doorStartY && nx >= doorStartX && nx < doorStartX + span) continue;
+            if (!horizontal && nx == doorStartX && ny >= doorStartY && ny < doorStartY + span) continue;
+
+            if (_grid[nx, ny] == CellType.Wall || _grid[nx, ny] == CellType.Window)
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private bool IsDoorwayDuplicate(DesignatedDoorway candidate, List<DesignatedDoorway> approved)
+    {
+        for (int i = 0; i < approved.Count; i++)
+        {
+            var other = approved[i];
+            if (candidate.IsHorizontal != other.IsHorizontal) continue;
+
+            if (candidate.IsHorizontal)
+            {
+                if (Mathf.Abs(candidate.StartY - other.StartY) <= 2)
+                {
+                    int overlapMin = Mathf.Max(candidate.StartX, other.StartX);
+                    int overlapMax = Mathf.Min(candidate.StartX + candidate.Span, other.StartX + other.Span);
+                    if (overlapMax - overlapMin >= 2) return true;
+                }
+            }
+            else
+            {
+                if (Mathf.Abs(candidate.StartX - other.StartX) <= 2)
+                {
+                    int overlapMin = Mathf.Max(candidate.StartY, other.StartY);
+                    int overlapMax = Mathf.Min(candidate.StartY + candidate.Span, other.StartY + other.Span);
+                    if (overlapMax - overlapMin >= 2) return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    private bool IsInsideSameRoom(int x1, int y1, int x2, int y2)
+    {
+        if (_rooms == null) return false;
+        var p1 = new Vector2Int(x1, y1);
+        var p2 = new Vector2Int(x2, y2);
+        for (int i = 0; i < _rooms.Count; i++)
+        {
+            RectInt b = _rooms[i].Bounds;
+            if (b.Contains(p1) && b.Contains(p2)) return true;
+        }
+        return false;
+    }
+
     /// <summary>
     /// Post-carve pass that validates every designated doorway, prevents any door from spawning
-    /// inside a solid wall, anchors door hinges flush to solid wall jambs, and scales doors so they
-    /// fill 100.0% of the entire doorway width from jamb to jamb.
+    /// inside a solid wall or floating on an isolated pillar, anchors door hinges flush to solid wall jambs,
+    /// and scales doors so they fill 100.0% of the entire doorway width from jamb to jamb.
     /// </summary>
     private void NormalizeAndSpawnAllDoorsForFloor(int floorLevel)
     {
@@ -3744,6 +3805,7 @@ public class FactoryMapGenerator : NetworkBehaviour
 
         bool[,] handled = new bool[_width, _height];
         var designated = _currentFloor.DesignatedDoorways;
+        var approvedDoorways = new List<DesignatedDoorway>();
 
         for (int i = 0; i < designated.Count; i++)
         {
@@ -3756,7 +3818,7 @@ public class FactoryMapGenerator : NetworkBehaviour
             {
                 if (x < 1 || x + span >= _width - 1 || y < 0 || y >= _height) continue;
 
-                // Check if any tile in this doorway was already handled by an earlier identical doorway
+                // Check if any tile in this doorway was already handled
                 bool alreadyHandled = false;
                 for (int s = 0; s < span; s++)
                 {
@@ -3764,10 +3826,19 @@ public class FactoryMapGenerator : NetworkBehaviour
                 }
                 if (alreadyHandled) continue;
 
+                // Deduplication check: no duplicate or back-to-back parallel doorways within 2 tiles
+                if (IsDoorwayDuplicate(dd, approvedDoorways))
+                {
+                    for (int s = 0; s < span; s++)
+                    {
+                        if (_grid[x + s, y] == CellType.Doorway)
+                            _grid[x + s, y] = CellType.Wall;
+                    }
+                    continue;
+                }
+
                 // ── SAFETY CHECK 1: Ensure doorway connects two open walkable spaces (North & South) ──
-                // If y is an outer perimeter wall (y == 0 or y == _height - 1), it opens to the outside courtyard.
-                // Otherwise, both y - 1 and y + 1 must have walkable open space. If either side is solid wall across
-                // the entire span, this doorway leads into a solid wall — DO NOT spawn a door and seal it!
+                bool isPerimeter = (y == 0 || y == _height - 1);
                 bool hasPassageNorth = (y == _height - 1);
                 bool hasPassageSouth = (y == 0);
 
@@ -3788,33 +3859,64 @@ public class FactoryMapGenerator : NetworkBehaviour
 
                 if (!hasPassageNorth || !hasPassageSouth)
                 {
-                    // Doorway leads into a solid wall — revert all span tiles to solid Wall so no door can spawn inside!
                     for (int s = 0; s < span; s++)
                     {
                         if (_grid[x + s, y] == CellType.Doorway)
-                        {
                             _grid[x + s, y] = CellType.Wall;
-                        }
                     }
                     continue;
                 }
 
-                // ── SAFETY CHECK 2: Lock solid wall jambs and set all doorway opening tiles ──
-                if (x - 1 >= 0 && _grid[x - 1, y] != CellType.Window)
+                // ── SAFETY CHECK 2: Distinct spaces check (door cannot be in the middle of a single room) ──
+                if (!isPerimeter && IsInsideSameRoom(x + span / 2, y + 1, x + span / 2, y - 1))
                 {
-                    _grid[x - 1, y] = CellType.Wall;
+                    for (int s = 0; s < span; s++)
+                    {
+                        if (_grid[x + s, y] == CellType.Doorway)
+                            _grid[x + s, y] = CellType.RoomFloor;
+                    }
+                    continue;
                 }
-                if (x + span < _width && _grid[x + span, y] != CellType.Window)
+
+                // ── SAFETY CHECK 3: Solid contiguous wall jambs (NO standalone 1x1 pillars!) ──
+                if (!isPerimeter)
                 {
-                    _grid[x + span, y] = CellType.Wall;
+                    // Both jambs must ALREADY be solid Wall or Window
+                    if ((_grid[x - 1, y] != CellType.Wall && _grid[x - 1, y] != CellType.Window) ||
+                        (_grid[x + span, y] != CellType.Wall && _grid[x + span, y] != CellType.Window))
+                    {
+                        // Doorway lacks solid wall jambs — do NOT spawn door!
+                        for (int s = 0; s < span; s++)
+                        {
+                            if (_grid[x + s, y] == CellType.Doorway)
+                                _grid[x + s, y] = CellType.HallwayFloor;
+                        }
+                        continue;
+                    }
+
+                    // Neither jamb may be an isolated 1x1 pillar!
+                    if (!HasWallContinuity(x - 1, y, x, y, span, true) ||
+                        !HasWallContinuity(x + span, y, x, y, span, true))
+                    {
+                        // Isolated pillar jamb detected — do NOT spawn door!
+                        for (int s = 0; s < span; s++)
+                        {
+                            if (_grid[x + s, y] == CellType.Doorway)
+                                _grid[x + s, y] = CellType.HallwayFloor;
+                        }
+                        continue;
+                    }
                 }
+
+                // All safety checks passed: mark cells and approve
                 for (int s = 0; s < span; s++)
                 {
                     _grid[x + s, y] = CellType.Doorway;
                     handled[x + s, y] = true;
                 }
+                approvedDoorways.Add(dd);
 
-                // ── SAFETY CHECK 3: Clear any cover pillars in the entire door swing and approach zone ──
+                // Clear any cover pillars in the entire door swing and approach zone
                 for (int cx = x - 2; cx <= x + span + 1; cx++)
                 {
                     for (int cy = y - 4; cy <= y + 4; cy++)
@@ -3827,7 +3929,7 @@ public class FactoryMapGenerator : NetworkBehaviour
                     }
                 }
 
-                // ── SAFETY CHECK 4: Spawn doors flush to wall jambs, filling 100% of doorway width ──
+                // Spawn doors flush to wall jambs, filling 100% of doorway width
                 float totalLeafLen;
                 Vector2 leftJambWorld = GridToWorld(x - 0.5f, y);
                 Vector2 rightJambWorld = GridToWorld(x + span - 0.5f, y);
@@ -3860,7 +3962,6 @@ public class FactoryMapGenerator : NetworkBehaviour
             {
                 if (x < 0 || x >= _width || y < 1 || y + span >= _height - 1) continue;
 
-                // Check if any tile in this doorway was already handled
                 bool alreadyHandled = false;
                 for (int s = 0; s < span; s++)
                 {
@@ -3868,7 +3969,19 @@ public class FactoryMapGenerator : NetworkBehaviour
                 }
                 if (alreadyHandled) continue;
 
+                // Deduplication check
+                if (IsDoorwayDuplicate(dd, approvedDoorways))
+                {
+                    for (int s = 0; s < span; s++)
+                    {
+                        if (_grid[x, y + s] == CellType.Doorway)
+                            _grid[x, y + s] = CellType.Wall;
+                    }
+                    continue;
+                }
+
                 // ── SAFETY CHECK 1: Ensure doorway connects two open walkable spaces (East & West) ──
+                bool isPerimeter = (x == 0 || x == _width - 1);
                 bool hasPassageEast = (x == _width - 1);
                 bool hasPassageWest = (x == 0);
 
@@ -3889,33 +4002,64 @@ public class FactoryMapGenerator : NetworkBehaviour
 
                 if (!hasPassageEast || !hasPassageWest)
                 {
-                    // Doorway leads into a solid wall — revert all span tiles to solid Wall so no door can spawn inside!
                     for (int s = 0; s < span; s++)
                     {
                         if (_grid[x, y + s] == CellType.Doorway)
-                        {
                             _grid[x, y + s] = CellType.Wall;
-                        }
                     }
                     continue;
                 }
 
-                // ── SAFETY CHECK 2: Lock solid wall jambs and set all doorway opening tiles ──
-                if (y - 1 >= 0 && _grid[x, y - 1] != CellType.Window)
+                // ── SAFETY CHECK 2: Distinct spaces check (door cannot be in the middle of a single room) ──
+                if (!isPerimeter && IsInsideSameRoom(x + 1, y + span / 2, x - 1, y + span / 2))
                 {
-                    _grid[x, y - 1] = CellType.Wall;
+                    for (int s = 0; s < span; s++)
+                    {
+                        if (_grid[x, y + s] == CellType.Doorway)
+                            _grid[x, y + s] = CellType.RoomFloor;
+                    }
+                    continue;
                 }
-                if (y + span < _height && _grid[x, y + span] != CellType.Window)
+
+                // ── SAFETY CHECK 3: Solid contiguous wall jambs (NO standalone 1x1 pillars!) ──
+                if (!isPerimeter)
                 {
-                    _grid[x, y + span] = CellType.Wall;
+                    // Both jambs must ALREADY be solid Wall or Window
+                    if ((_grid[x, y - 1] != CellType.Wall && _grid[x, y - 1] != CellType.Window) ||
+                        (_grid[x, y + span] != CellType.Wall && _grid[x, y + span] != CellType.Window))
+                    {
+                        // Doorway lacks solid wall jambs — do NOT spawn door!
+                        for (int s = 0; s < span; s++)
+                        {
+                            if (_grid[x, y + s] == CellType.Doorway)
+                                _grid[x, y + s] = CellType.HallwayFloor;
+                        }
+                        continue;
+                    }
+
+                    // Neither jamb may be an isolated 1x1 pillar!
+                    if (!HasWallContinuity(x, y - 1, x, y, span, false) ||
+                        !HasWallContinuity(x, y + span, x, y, span, false))
+                    {
+                        // Isolated pillar jamb detected — do NOT spawn door!
+                        for (int s = 0; s < span; s++)
+                        {
+                            if (_grid[x, y + s] == CellType.Doorway)
+                                _grid[x, y + s] = CellType.HallwayFloor;
+                        }
+                        continue;
+                    }
                 }
+
+                // All safety checks passed: mark cells and approve
                 for (int s = 0; s < span; s++)
                 {
                     _grid[x, y + s] = CellType.Doorway;
                     handled[x, y + s] = true;
                 }
+                approvedDoorways.Add(dd);
 
-                // ── SAFETY CHECK 3: Clear any cover pillars in the entire door swing and approach zone ──
+                // Clear any cover pillars in the entire door swing and approach zone
                 for (int cx = x - 4; cx <= x + 4; cx++)
                 {
                     for (int cy = y - 2; cy <= y + span + 1; cy++)
@@ -3928,7 +4072,7 @@ public class FactoryMapGenerator : NetworkBehaviour
                     }
                 }
 
-                // ── SAFETY CHECK 4: Spawn doors flush to wall jambs, filling 100% of doorway width ──
+                // Spawn doors flush to wall jambs, filling 100% of doorway width
                 float totalLeafLen;
                 Vector2 bottomJambWorld = GridToWorld(x, y - 0.5f);
                 Vector2 topJambWorld = GridToWorld(x, y + span - 0.5f);
@@ -4245,6 +4389,98 @@ public class FactoryMapGenerator : NetworkBehaviour
         EnforceMinimumHallwayWidthOnGrid();
     }
 
+    private bool CanWidenHallwayIntoWall(int wx, int wy)
+    {
+        if (wx <= 1 || wx >= _width - 2 || wy <= 1 || wy >= _height - 2) return false;
+        if (_grid[wx, wy] != CellType.Wall) return false;
+
+        // 1. Never convert a wall tile adjacent to any doorway within 2 tiles (preserves jambs!)
+        for (int dx = -2; dx <= 2; dx++)
+        {
+            for (int dy = -2; dy <= 2; dy++)
+            {
+                int nx = wx + dx;
+                int ny = wy + dy;
+                if (nx >= 0 && nx < _width && ny >= 0 && ny < _height)
+                {
+                    if (_grid[nx, ny] == CellType.Doorway) return false;
+                }
+            }
+        }
+
+        // 2. Never convert an exterior room wall (borders RoomFloor or ObjectiveRoomFloor)
+        int[] cdx = { 0, 0, -1, 1 };
+        int[] cdy = { 1, -1, 0, 0 };
+        for (int d = 0; d < 4; d++)
+        {
+            int nx = wx + cdx[d];
+            int ny = wy + cdy[d];
+            if (nx >= 0 && nx < _width && ny >= 0 && ny < _height)
+            {
+                CellType t = _grid[nx, ny];
+                if (t == CellType.RoomFloor || t == CellType.ObjectiveRoomFloor) return false;
+            }
+        }
+
+        // 3. Never convert a wall if doing so would isolate any neighbor wall tile into a 1x1 pillar
+        for (int d = 0; d < 4; d++)
+        {
+            int nx = wx + cdx[d];
+            int ny = wy + cdy[d];
+            if (nx > 0 && nx < _width - 1 && ny > 0 && ny < _height - 1)
+            {
+                if (_grid[nx, ny] == CellType.Wall)
+                {
+                    int remainingSolid = 0;
+                    for (int nd = 0; nd < 4; nd++)
+                    {
+                        int nnx = nx + cdx[nd];
+                        int nny = ny + cdy[nd];
+                        if (nnx == wx && nny == wy) continue;
+                        if (nnx >= 0 && nnx < _width && nny >= 0 && nny < _height)
+                        {
+                            if (_grid[nnx, nny] == CellType.Wall || _grid[nnx, nny] == CellType.Window)
+                                remainingSolid++;
+                        }
+                    }
+                    if (remainingSolid == 0) return false;
+                }
+            }
+        }
+
+        return true;
+    }
+
+    private bool CanRevertNarrowDeadEndNotch(int x, int y)
+    {
+        if (x <= 1 || x >= _width - 2 || y <= 1 || y >= _height - 2) return false;
+        if (_grid[x, y] != CellType.HallwayFloor) return false;
+
+        // Never revert actual exterior entrances on floor 0
+        if (_currentFloor != null && _currentFloor.FloorLevel == 0 && _entrances != null)
+        {
+            for (int i = 0; i < _entrances.Length; i++)
+            {
+                var cell = _entrances[i].GridCell;
+                if (Mathf.Abs(x - cell.x) <= 2 && Mathf.Abs(y - cell.y) <= 2) return false;
+            }
+        }
+
+        int wallCount = 0;
+        int[] cdx = { 0, 0, -1, 1 };
+        int[] cdy = { 1, -1, 0, 0 };
+        for (int d = 0; d < 4; d++)
+        {
+            int nx = x + cdx[d];
+            int ny = y + cdy[d];
+            if (nx >= 0 && nx < _width && ny >= 0 && ny < _height)
+            {
+                if (_grid[nx, ny] == CellType.Wall || _grid[nx, ny] == CellType.Window) wallCount++;
+            }
+        }
+        return wallCount >= 3;
+    }
+
     /// <summary>
     /// Scans all <see cref="CellType.HallwayFloor"/> tiles on the current floor and guarantees that
     /// no hallway segment is narrower than <see cref="GetMinHallwayWidthTiles"/> (&gt;= 1.5x player body diameter).
@@ -4253,6 +4489,26 @@ public class FactoryMapGenerator : NetworkBehaviour
     private void EnforceMinimumHallwayWidthOnGrid()
     {
         int minTiles = GetMinHallwayWidthTiles();
+
+        // Safety pass: Pre-clean 1-tile dead-end notches (surrounded by 3+ solid walls) back to Wall
+        bool notchCleaned = true;
+        int notchPasses = 0;
+        while (notchCleaned && notchPasses < 5)
+        {
+            notchCleaned = false;
+            notchPasses++;
+            for (int y = 2; y < _height - 2; y++)
+            {
+                for (int x = 2; x < _width - 2; x++)
+                {
+                    if (CanRevertNarrowDeadEndNotch(x, y))
+                    {
+                        _grid[x, y] = CellType.Wall;
+                        notchCleaned = true;
+                    }
+                }
+            }
+        }
 
         for (int pass = 0; pass < 2; pass++)
         {
@@ -4271,18 +4527,22 @@ public class FactoryMapGenerator : NetworkBehaviour
                     {
                         if (spanX < minTiles)
                         {
-                            if (rightWallX < _width - 2 && _grid[rightWallX, y] == CellType.Wall)
+                            if (rightWallX < _width - 2 && CanWidenHallwayIntoWall(rightWallX, y))
                                 _grid[rightWallX, y] = CellType.HallwayFloor;
-                            else if (leftWallX > 1 && _grid[leftWallX, y] == CellType.Wall)
+                            else if (leftWallX > 1 && CanWidenHallwayIntoWall(leftWallX, y))
                                 _grid[leftWallX, y] = CellType.HallwayFloor;
+                            else if (CanRevertNarrowDeadEndNotch(x, y))
+                                _grid[x, y] = CellType.Wall;
                         }
 
-                        if (spanY < minTiles)
+                        if (spanY < minTiles && _grid[x, y] == CellType.HallwayFloor)
                         {
-                            if (topWallY < _height - 2 && _grid[x, topWallY] == CellType.Wall)
+                            if (topWallY < _height - 2 && CanWidenHallwayIntoWall(x, topWallY))
                                 _grid[x, topWallY] = CellType.HallwayFloor;
-                            else if (bottomWallY > 1 && _grid[x, bottomWallY] == CellType.Wall)
+                            else if (bottomWallY > 1 && CanWidenHallwayIntoWall(x, bottomWallY))
                                 _grid[x, bottomWallY] = CellType.HallwayFloor;
+                            else if (CanRevertNarrowDeadEndNotch(x, y))
+                                _grid[x, y] = CellType.Wall;
                         }
                     }
                 }
@@ -4352,26 +4612,82 @@ public class FactoryMapGenerator : NetworkBehaviour
     {
         bool[,] reachable = ComputeReachableFloor();
 
-        // Find a reachable interior anchor to carve L-corridors toward when an entrance is isolated.
-        // Prefer a point near the objective room or the largest room; fall back to interior midpoint.
-        int anchorX = interiorBounds.xMin + interiorBounds.width  / 2;
-        int anchorY = interiorBounds.yMin + interiorBounds.height / 2;
-        if (_currentFloor.CentralRoomBounds.width > 0)
-        {
-            anchorX = _currentFloor.CentralRoomBounds.xMin + _currentFloor.CentralRoomBounds.width  / 2;
-            anchorY = _currentFloor.CentralRoomBounds.yMin + _currentFloor.CentralRoomBounds.height / 2;
-        }
-
         for (int e = 0; e < 4; e++)
         {
             Vector2Int entCell = _entrances[e].GridCell;
             if (!reachable[entCell.x, entCell.y])
             {
-                Vector2Int interiorTarget = new Vector2Int(
-                    Mathf.Clamp(anchorX, interiorBounds.xMin, interiorBounds.xMax - hw),
-                    Mathf.Clamp(anchorY, interiorBounds.yMin, interiorBounds.yMax - hw));
-                CarveLCorridor(entCell, interiorTarget, hw, _entrances[e].WallSide == 0 || _entrances[e].WallSide == 2);
+                ConnectEntranceToReachableNetwork(entCell, reachable, hw);
+                reachable = ComputeReachableFloor();
             }
+        }
+    }
+
+    private void ConnectEntranceToReachableNetwork(Vector2Int startCell, bool[,] reachable, int hw)
+    {
+        var queue = new Queue<Vector2Int>();
+        var visited = new bool[_width, _height];
+        var parent = new Vector2Int[_width, _height];
+
+        queue.Enqueue(startCell);
+        visited[startCell.x, startCell.y] = true;
+        parent[startCell.x, startCell.y] = new Vector2Int(-1, -1);
+
+        Vector2Int target = new Vector2Int(-1, -1);
+        int[] cdx = { 0, 0, 1, -1 };
+        int[] cdy = { 1, -1, 0, 0 };
+
+        while (queue.Count > 0)
+        {
+            Vector2Int cur = queue.Dequeue();
+            if (reachable[cur.x, cur.y] && _grid[cur.x, cur.y] == CellType.HallwayFloor)
+            {
+                target = cur;
+                break;
+            }
+
+            for (int d = 0; d < 4; d++)
+            {
+                int nx = cur.x + cdx[d];
+                int ny = cur.y + cdy[d];
+
+                if (nx <= 1 || nx >= _width - 2 || ny <= 1 || ny >= _height - 2) continue;
+                if (visited[nx, ny]) continue;
+                if (_grid[nx, ny] == CellType.RoomFloor || _grid[nx, ny] == CellType.ObjectiveRoomFloor) continue;
+                if (IntersectsAnyStairwellBay(nx, nx, ny, ny)) continue;
+
+                visited[nx, ny] = true;
+                parent[nx, ny] = cur;
+                queue.Enqueue(new Vector2Int(nx, ny));
+            }
+        }
+
+        if (target.x < 0) return;
+
+        Vector2Int p = target;
+        while (p.x != -1 && p.y != -1)
+        {
+            int hx = Mathf.Clamp(p.x - (hw - 1) / 2, 2, _width - hw - 2);
+            int hy = Mathf.Clamp(p.y - (hw - 1) / 2, 2, _height - hw - 2);
+            for (int ox = 0; ox < hw; ox++)
+            {
+                for (int oy = 0; oy < hw; oy++)
+                {
+                    int cx = hx + ox;
+                    int cy = hy + oy;
+                    if (!IntersectsAnyStairwellBay(cx, cx, cy, cy) &&
+                        _grid[cx, cy] != CellType.RoomFloor &&
+                        _grid[cx, cy] != CellType.ObjectiveRoomFloor &&
+                        _grid[cx, cy] != CellType.Doorway)
+                    {
+                        if (CanWidenHallwayIntoWall(cx, cy) || _grid[cx, cy] == CellType.HallwayFloor)
+                        {
+                            _grid[cx, cy] = CellType.HallwayFloor;
+                        }
+                    }
+                }
+            }
+            p = parent[p.x, p.y];
         }
     }
 

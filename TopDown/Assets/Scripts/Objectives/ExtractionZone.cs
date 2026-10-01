@@ -275,6 +275,15 @@ public class ExtractionZone : NetworkBehaviour
         transform.localScale = new Vector3(diameter * 0.5f, diameter * 0.5f, 1f);
     }
 
+    private void OnDrawGizmos()
+    {
+        Color col = _team != null ? _team.TeamColor : new Color(0.3f, 0.8f, 0.5f, 1f);
+        Gizmos.color = new Color(col.r, col.g, col.b, 0.25f);
+        Gizmos.DrawSphere(transform.position, Radius);
+        Gizmos.color = new Color(col.r, col.g, col.b, 0.9f);
+        Gizmos.DrawWireSphere(transform.position, Radius);
+    }
+
     private void OnGUI()
     {
         if (!IsExtracted) return;

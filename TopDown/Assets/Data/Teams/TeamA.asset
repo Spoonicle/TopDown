@@ -13,4 +13,4 @@ MonoBehaviour:
   m_Name: TeamA
   m_EditorClassIdentifier: Assembly-CSharp::TeamData
   _teamName: Team A
-  _teamColor: {r: 0.29, g: 0.416, b: 0.541, a: 1}
+  _teamColor: {r: 0, g: 0.7, b: 1, a: 1}

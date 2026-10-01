@@ -303,6 +303,18 @@ public class FactoryMapGenerator : NetworkBehaviour
     /// <summary>True if all teams are equidistant within tight tolerance (delta &lt;= 0.6 seconds of sprinting).</summary>
     public bool AllTeamsEquidistantVerified { get; private set; }
 
+    /// <summary>Minimum Euclidean distance in world units between any two team spawn points.</summary>
+    public float MinObservedTeamSpawnDistanceWorld { get; private set; }
+
+    /// <summary>Minimum Euclidean distance in world units between any two team entrance doors.</summary>
+    public float MinObservedTeamDoorDistanceWorld { get; private set; }
+
+    /// <summary>Minimum Euclidean distance in world units between any two team interior breach points.</summary>
+    public float MinObservedTeamInteriorDistanceWorld { get; private set; }
+
+    /// <summary>True if all team spawns and doors maintain safe separation distances to prevent premature combat.</summary>
+    public bool AllTeamSpawnsSeparatedVerified { get; private set; }
+
     /// <summary>World positions of the 4 shifted perimeter entrances on the 1st Floor (North, East, South, West).</summary>
     public Vector2[] GetEntranceWorldPositions()
     {
@@ -771,6 +783,10 @@ public class FactoryMapGenerator : NetworkBehaviour
         AllDoorsFillDoorwaysVerified = true;
         AllDoorsClearOfPillarsVerified = true;
         MinObservedHallwayWidthWorld = float.MaxValue;
+        MinObservedTeamSpawnDistanceWorld = float.MaxValue;
+        MinObservedTeamDoorDistanceWorld = float.MaxValue;
+        MinObservedTeamInteriorDistanceWorld = float.MaxValue;
+        AllTeamSpawnsSeparatedVerified = false;
         CurrentLocalFloorLevel = 0;
         CurrentStairClimbProgress = -1f;
 
@@ -893,49 +909,57 @@ public class FactoryMapGenerator : NetworkBehaviour
         int margin = (_config != null ? _config.EntranceCornerMargin : 18) + hw + 2;
 
         // Bay is 4 tiles wide (BayX..BayX+3), 10 tiles tall (BayMinY..BayMinY+9).
-        // Build a pool of candidate bay positions along the West and East interior margins,
-        // distributed vertically so they don't collide with entrance vestibules.
+        // Build candidate bay positions along West and East interior margins.
         int westBayX   = margin;
         int westThroatX = westBayX + 4;  // throat opens to the east, into the interior
         int eastBayX   = _width - margin - 4;
         int eastThroatX = eastBayX - 1;  // throat opens to the west, into the interior
 
-        // Three vertical positions — top quarter, mid, bottom quarter — per side
-        int bayYTop    = margin;
-        int bayYMid    = (_height - 10) / 2;
-        int bayYBot    = _height - margin - 10;
+        int stairYMargin = Mathf.Max(8, (_config != null ? _config.EntranceCornerMargin : 14));
+        int bayYTop = stairYMargin;
+        int bayYBot = _height - stairYMargin - 10;
+        int bayYMid = (_height - 10) / 2;
 
-        var pool0 = new (int bayX, int bayMinY, int throatX, bool opensEast)[]
+        var candidateSlots = new List<(int bayX, int bayMinY, int throatX, bool opensEast)>
         {
             (westBayX, bayYTop, westThroatX, true),
-            (eastBayX, bayYTop, eastThroatX, false),
-            (westBayX, bayYMid, westThroatX, true)
-        };
-
-        var pool1 = new (int bayX, int bayMinY, int throatX, bool opensEast)[]
-        {
             (eastBayX, bayYBot, eastThroatX, false),
             (westBayX, bayYBot, westThroatX, true),
-            (eastBayX, bayYMid, eastThroatX, false)
+            (eastBayX, bayYTop, eastThroatX, false)
         };
+
+        // Only include mid-height slots if vertical space permits at least 12 tiles clearance
+        if ((bayYMid - bayYTop >= 12) && (bayYBot - bayYMid >= 12))
+        {
+            candidateSlots.Add((westBayX, bayYMid, westThroatX, true));
+            candidateSlots.Add((eastBayX, bayYMid, eastThroatX, false));
+        }
 
         for (int t = 0; t < _activeFloors.Count - 1; t++)
         {
             int lowerFloor = _activeFloors[t];
             int upperFloor = _activeFloors[t + 1];
-            int stairCount = rng.Next(1, 4);
 
-            var pool = (t == 0) ? pool0 : pool1;
-            int[] order = { 0, 1, 2 };
-            for (int k = 2; k > 0; k--)
+            // Shuffle available slots
+            int[] order = new int[candidateSlots.Count];
+            for (int i = 0; i < order.Length; i++) order[i] = i;
+            for (int k = order.Length - 1; k > 0; k--)
             {
                 int swap = rng.Next(k + 1);
                 (order[k], order[swap]) = (order[swap], order[k]);
             }
 
-            for (int s = 0; s < stairCount; s++)
+            int targetCount = rng.Next(1, 3); // 1 or 2 staircases per floor transition
+            int added = 0;
+
+            for (int s = 0; s < order.Length && added < targetCount; s++)
             {
-                var slot = pool[order[s]];
+                var slot = candidateSlots[order[s]];
+                if (IntersectsAnyStairwellBay(slot.bayX, slot.bayX + 3, slot.bayMinY, slot.bayMinY + 9))
+                {
+                    continue;
+                }
+
                 _plannedStaircases.Add(new StaircaseShaftPlan
                 {
                     LowerFloor = lowerFloor,
@@ -945,6 +969,53 @@ public class FactoryMapGenerator : NetworkBehaviour
                     ThroatX = slot.throatX,
                     OpensToEastRing = slot.opensEast
                 });
+                added++;
+            }
+
+            // Guaranteed connectivity fallback: if all candidate slots collided, place at least one staircase
+            if (added == 0)
+            {
+                bool placed = false;
+                for (int s = 0; s < order.Length; s++)
+                {
+                    var slot = candidateSlots[order[s]];
+                    bool exactMatch = false;
+                    for (int p = 0; p < _plannedStaircases.Count; p++)
+                    {
+                        if (_plannedStaircases[p].BayX == slot.bayX && _plannedStaircases[p].BayMinY == slot.bayMinY)
+                        {
+                            exactMatch = true;
+                            break;
+                        }
+                    }
+                    if (!exactMatch)
+                    {
+                        _plannedStaircases.Add(new StaircaseShaftPlan
+                        {
+                            LowerFloor = lowerFloor,
+                            UpperFloor = upperFloor,
+                            BayX = slot.bayX,
+                            BayMinY = slot.bayMinY,
+                            ThroatX = slot.throatX,
+                            OpensToEastRing = slot.opensEast
+                        });
+                        placed = true;
+                        break;
+                    }
+                }
+                if (!placed)
+                {
+                    var slot = candidateSlots[order[0]];
+                    _plannedStaircases.Add(new StaircaseShaftPlan
+                    {
+                        LowerFloor = lowerFloor,
+                        UpperFloor = upperFloor,
+                        BayX = slot.bayX,
+                        BayMinY = slot.bayMinY,
+                        ThroatX = slot.throatX,
+                        OpensToEastRing = slot.opensEast
+                    });
+                }
             }
         }
     }
@@ -1158,10 +1229,10 @@ public class FactoryMapGenerator : NetworkBehaviour
     /// <summary>
     /// Reserves all planned stairwell bays in <c>_entranceProtectedZone</c> and carves the 4x10 stairwell shaft
     /// on any floor connected by that staircase:
-    /// - On <c>LowerFloor</c>: opens the entire stairwell side into the ring hallway so players can either
-    ///   enter at the Bottom Landing to climb ON TOP of the stairs, or walk UNDERNEATH the elevated upper half!
-    /// - On <c>UpperFloor</c>: opens a full 4-tile-wide Top Landing passage into the ring hallway while keeping
-    ///   the lower drop-off railed off by concrete wall.
+    /// - On <c>LowerFloor</c>: opens ONLY the bottom landing entrance (4 tiles wide) into the hallway, while the
+    ///   upper portion of the staircase is covered by solid concrete wall so players cannot walk under the stairs.
+    /// - On <c>UpperFloor</c>: opens ONLY the top landing entrance (4 tiles wide) into the hallway, while the
+    ///   lower drop-off portion is covered by solid concrete wall.
     /// </summary>
     private void CarveAndReserveStairwellBaysForFloor(int floorLevel)
     {
@@ -1199,16 +1270,25 @@ public class FactoryMapGenerator : NetworkBehaviour
 
             if (floorLevel == plan.LowerFloor)
             {
-                // On the lower floor, open the full side facing the ring hallway (and top under-stair exit)
-                // so players can walk into the Bottom Landing to climb OR walk underneath the elevated upper half!
-                for (int y = plan.BayMinY; y < plan.BayMinY + 10; y++)
+                // On the lower floor, open ONLY the bottom landing entrance (y = BayMinY .. BayMinY + 3).
+                // The upper portion (y = BayMinY + 4 .. BayMinY + 9) remains solid Wall, covering the side of the stairs!
+                for (int y = plan.BayMinY; y < plan.BayMinY + 4; y++)
                 {
                     _grid[plan.ThroatX, y] = CellType.HallwayFloor;
+                }
+                for (int y = plan.BayMinY + 4; y < plan.BayMinY + 10; y++)
+                {
+                    _grid[plan.ThroatX, y] = CellType.Wall;
                 }
             }
             else if (floorLevel == plan.UpperFloor)
             {
-                // On the upper floor, open a 4-tile-wide Top Landing passage (>= 4x player body) into the ring hallway
+                // On the upper floor, open ONLY the top landing entrance (y = BayMinY + 6 .. BayMinY + 9).
+                // The lower drop-off portion (y = BayMinY .. BayMinY + 5) remains solid Wall, covering the side of the stairs!
+                for (int y = plan.BayMinY; y < plan.BayMinY + 6; y++)
+                {
+                    _grid[plan.ThroatX, y] = CellType.Wall;
+                }
                 for (int y = plan.BayMinY + 6; y < plan.BayMinY + 10; y++)
                 {
                     _grid[plan.ThroatX, y] = CellType.HallwayFloor;
@@ -1245,8 +1325,9 @@ public class FactoryMapGenerator : NetworkBehaviour
 
         int crossY = (_height - hw) / 2;
 
-        int flankYMin = margin;
-        int flankYMax = _height - margin;
+        int stairYMargin = Mathf.Max(8, (_config != null ? _config.EntranceCornerMargin : 14));
+        int flankYMin = Mathf.Clamp(Mathf.Min(margin, stairYMargin - 2), 2, _height - 2);
+        int flankYMax = Mathf.Clamp(Mathf.Max(_height - margin, _height - stairYMargin + 2), 2, _height - 2);
 
         // 1. Carve West & East flanking hallways connecting stairwells
         for (int y = flankYMin; y < flankYMax; y++)
@@ -1350,6 +1431,33 @@ public class FactoryMapGenerator : NetworkBehaviour
         public float TravelTime;
         public Vector2 WorldDoorPos;
         public Vector2 WorldSpawnPos;
+        public Vector2 WorldInteriorPos;
+    }
+
+    /// <summary>
+    /// Checks whether all selected entrance candidates maintain safe Euclidean separation
+    /// between spawns (exterior), doors (building perimeter), and interior breach points (interior).
+    /// </summary>
+    private static bool AreCandidatesSafelySeparated(
+        EntranceCandidate[] cands,
+        float minSpawnSep,
+        float minDoorSep,
+        float minInteriorSep)
+    {
+        if (cands == null || cands.Length <= 1) return true;
+        for (int i = 0; i < cands.Length; i++)
+        {
+            for (int j = i + 1; j < cands.Length; j++)
+            {
+                if (Vector2.Distance(cands[i].WorldSpawnPos, cands[j].WorldSpawnPos) < minSpawnSep)
+                    return false;
+                if (Vector2.Distance(cands[i].WorldDoorPos, cands[j].WorldDoorPos) < minDoorSep)
+                    return false;
+                if (Vector2.Distance(cands[i].WorldInteriorPos, cands[j].WorldInteriorPos) < minInteriorSep)
+                    return false;
+            }
+        }
+        return true;
     }
 
     /// <summary>
@@ -1421,7 +1529,8 @@ public class FactoryMapGenerator : NetworkBehaviour
                             TotalDist = totalDist,
                             TravelTime = travelTime,
                             WorldDoorPos = GridToWorld(x + halfHwOffset, _height - 1),
-                            WorldSpawnPos = GridToWorld(x + halfHwOffset, _height - 1 + courtyardDist)
+                            WorldSpawnPos = GridToWorld(x + halfHwOffset, _height - 1 + courtyardDist),
+                            WorldInteriorPos = GridToWorld(x + halfHwOffset, hitY)
                         });
                     }
                 }
@@ -1468,7 +1577,8 @@ public class FactoryMapGenerator : NetworkBehaviour
                             TotalDist = totalDist,
                             TravelTime = travelTime,
                             WorldDoorPos = GridToWorld(_width - 1, y + halfHwOffset),
-                            WorldSpawnPos = GridToWorld(_width - 1 + courtyardDist, y + halfHwOffset)
+                            WorldSpawnPos = GridToWorld(_width - 1 + courtyardDist, y + halfHwOffset),
+                            WorldInteriorPos = GridToWorld(hitX, y + halfHwOffset)
                         });
                     }
                 }
@@ -1515,7 +1625,8 @@ public class FactoryMapGenerator : NetworkBehaviour
                             TotalDist = totalDist,
                             TravelTime = travelTime,
                             WorldDoorPos = GridToWorld(x + halfHwOffset, 0),
-                            WorldSpawnPos = GridToWorld(x + halfHwOffset, -courtyardDist)
+                            WorldSpawnPos = GridToWorld(x + halfHwOffset, -courtyardDist),
+                            WorldInteriorPos = GridToWorld(x + halfHwOffset, hitY)
                         });
                     }
                 }
@@ -1562,7 +1673,8 @@ public class FactoryMapGenerator : NetworkBehaviour
                             TotalDist = totalDist,
                             TravelTime = travelTime,
                             WorldDoorPos = GridToWorld(0, y + halfHwOffset),
-                            WorldSpawnPos = GridToWorld(-courtyardDist, y + halfHwOffset)
+                            WorldSpawnPos = GridToWorld(-courtyardDist, y + halfHwOffset),
+                            WorldInteriorPos = GridToWorld(hitX, y + halfHwOffset)
                         });
                     }
                 }
@@ -1581,134 +1693,207 @@ public class FactoryMapGenerator : NetworkBehaviour
         else if (GameObject.Find("ExtractionZone_TeamC") != null) teamCount = 3;
         else if (GameObject.Find("ExtractionZone_TeamB") != null) teamCount = 2;
 
+        float minSpawnSep = Mathf.Min(45.0f, Mathf.Min(_width, _height) * 0.45f);
+        float minDoorSep = Mathf.Min(30.0f, Mathf.Min(_width, _height) * 0.30f);
+        float minInteriorSep = Mathf.Min(18.0f, Mathf.Min(_width, _height) * 0.20f);
+
         float bestDelta = float.MaxValue;
         EntranceCandidate[] bestTeamCandidates = null;
 
-        if (teamCount == 3)
+        // Multi-tier search:
+        // Tier 0: full separation thresholds (minSpawnSep, minDoorSep, minInteriorSep)
+        // Tier 1: relaxed separation thresholds (70%)
+        // Tier 2: unconstrained fallback
+        for (int tier = 0; tier < 3 && bestTeamCandidates == null; tier++)
         {
-            int[][] sideCombos = new int[][]
-            {
-                new int[] { 0, 1, 2 },
-                new int[] { 0, 1, 3 },
-                new int[] { 0, 2, 3 },
-                new int[] { 1, 2, 3 }
-            };
+            float curMinSpawn = tier == 0 ? minSpawnSep : (tier == 1 ? minSpawnSep * 0.7f : 0f);
+            float curMinDoor = tier == 0 ? minDoorSep : (tier == 1 ? minDoorSep * 0.7f : 0f);
+            float curMinInterior = tier == 0 ? minInteriorSep : (tier == 1 ? minInteriorSep * 0.7f : 0f);
 
-            for (int comboIdx = 0; comboIdx < sideCombos.Length; comboIdx++)
+            if (teamCount == 3)
             {
-                int[] sides = sideCombos[comboIdx];
-                var list0 = candidatesBySide[sides[0]];
-                var list1 = candidatesBySide[sides[1]];
-                var list2 = candidatesBySide[sides[2]];
-                if (list0.Count == 0 || list1.Count == 0 || list2.Count == 0) continue;
-
-                for (int i0 = 0; i0 < list0.Count; i0++)
+                int[][] sideCombos = new int[][]
                 {
-                    float t0 = list0[i0].TravelTime;
-                    int idx1 = FindClosestIndex(list1, t0);
-                    int idx2 = FindClosestIndex(list2, t0);
+                    new int[] { 0, 1, 2 },
+                    new int[] { 0, 1, 3 },
+                    new int[] { 0, 2, 3 },
+                    new int[] { 1, 2, 3 }
+                };
 
-                    for (int d1 = -1; d1 <= 1; d1++)
-                    {
-                        int k1 = idx1 + d1;
-                        if (k1 < 0 || k1 >= list1.Count) continue;
-                        for (int d2 = -1; d2 <= 1; d2++)
-                        {
-                            int k2 = idx2 + d2;
-                            if (k2 < 0 || k2 >= list2.Count) continue;
-
-                            float t1 = list1[k1].TravelTime;
-                            float t2 = list2[k2].TravelTime;
-                            float minT = Mathf.Min(t0, Mathf.Min(t1, t2));
-                            float maxT = Mathf.Max(t0, Mathf.Max(t1, t2));
-                            float delta = maxT - minT;
-
-                            if (delta < bestDelta)
-                            {
-                                bestDelta = delta;
-                                bestTeamCandidates = new EntranceCandidate[] { list0[i0], list1[k1], list2[k2] };
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        else if (teamCount == 4)
-        {
-            var list0 = candidatesBySide[0];
-            var list1 = candidatesBySide[1];
-            var list2 = candidatesBySide[2];
-            var list3 = candidatesBySide[3];
-
-            if (list0.Count > 0 && list1.Count > 0 && list2.Count > 0 && list3.Count > 0)
-            {
-                for (int i0 = 0; i0 < list0.Count; i0++)
+                for (int comboIdx = 0; comboIdx < sideCombos.Length; comboIdx++)
                 {
-                    float t0 = list0[i0].TravelTime;
-                    int idx1 = FindClosestIndex(list1, t0);
-                    int idx2 = FindClosestIndex(list2, t0);
-                    int idx3 = FindClosestIndex(list3, t0);
+                    int[] sides = sideCombos[comboIdx];
+                    var list0 = candidatesBySide[sides[0]];
+                    var list1 = candidatesBySide[sides[1]];
+                    var list2 = candidatesBySide[sides[2]];
+                    if (list0.Count == 0 || list1.Count == 0 || list2.Count == 0) continue;
 
-                    for (int d1 = -1; d1 <= 1; d1++)
+                    for (int i0 = 0; i0 < list0.Count; i0++)
                     {
-                        int k1 = idx1 + d1;
-                        if (k1 < 0 || k1 >= list1.Count) continue;
-                        for (int d2 = -1; d2 <= 1; d2++)
-                        {
-                            int k2 = idx2 + d2;
-                            if (k2 < 0 || k2 >= list2.Count) continue;
-                            for (int d3 = -1; d3 <= 1; d3++)
-                            {
-                                int k3 = idx3 + d3;
-                                if (k3 < 0 || k3 >= list3.Count) continue;
+                        var c0 = list0[i0];
+                        float t0 = c0.TravelTime;
+                        int idx1 = FindClosestIndex(list1, t0);
+                        int idx2 = FindClosestIndex(list2, t0);
 
-                                float t1 = list1[k1].TravelTime;
-                                float t2 = list2[k2].TravelTime;
-                                float t3 = list3[k3].TravelTime;
-                                float minT = Mathf.Min(t0, Mathf.Min(t1, Mathf.Min(t2, t3)));
-                                float maxT = Mathf.Max(t0, Mathf.Max(t1, Mathf.Max(t2, t3)));
+                        int k1Min = idx1;
+                        while (k1Min > 0 && t0 - list1[k1Min - 1].TravelTime <= 0.65f) k1Min--;
+                        k1Min = Mathf.Min(k1Min, Mathf.Max(0, idx1 - 8));
+
+                        int k1Max = idx1;
+                        while (k1Max < list1.Count - 1 && list1[k1Max + 1].TravelTime - t0 <= 0.65f) k1Max++;
+                        k1Max = Mathf.Max(k1Max, Mathf.Min(list1.Count - 1, idx1 + 8));
+
+                        int k2Min = idx2;
+                        while (k2Min > 0 && t0 - list2[k2Min - 1].TravelTime <= 0.65f) k2Min--;
+                        k2Min = Mathf.Min(k2Min, Mathf.Max(0, idx2 - 8));
+
+                        int k2Max = idx2;
+                        while (k2Max < list2.Count - 1 && list2[k2Max + 1].TravelTime - t0 <= 0.65f) k2Max++;
+                        k2Max = Mathf.Max(k2Max, Mathf.Min(list2.Count - 1, idx2 + 8));
+
+                        for (int k1 = k1Min; k1 <= k1Max; k1++)
+                        {
+                            var c1 = list1[k1];
+                            float t1 = c1.TravelTime;
+                            if (Mathf.Abs(t0 - t1) >= bestDelta) continue;
+
+                            for (int k2 = k2Min; k2 <= k2Max; k2++)
+                            {
+                                var c2 = list2[k2];
+                                float t2 = c2.TravelTime;
+
+                                float minT = Mathf.Min(t0, Mathf.Min(t1, t2));
+                                float maxT = Mathf.Max(t0, Mathf.Max(t1, t2));
                                 float delta = maxT - minT;
 
-                                if (delta < bestDelta)
+                                if (delta >= bestDelta) continue;
+
+                                var cands = new EntranceCandidate[] { c0, c1, c2 };
+                                if (tier == 2 || AreCandidatesSafelySeparated(cands, curMinSpawn, curMinDoor, curMinInterior))
                                 {
                                     bestDelta = delta;
-                                    bestTeamCandidates = new EntranceCandidate[] { list0[i0], list1[k1], list2[k2], list3[k3] };
+                                    bestTeamCandidates = cands;
                                 }
                             }
                         }
                     }
                 }
             }
-        }
-        else // teamCount == 2
-        {
-            int[][] pairCombos = new int[][]
+            else if (teamCount == 4)
             {
-                new int[] { 0, 1 }, new int[] { 0, 2 }, new int[] { 0, 3 },
-                new int[] { 1, 2 }, new int[] { 1, 3 }, new int[] { 2, 3 }
-            };
+                var list0 = candidatesBySide[0];
+                var list1 = candidatesBySide[1];
+                var list2 = candidatesBySide[2];
+                var list3 = candidatesBySide[3];
 
-            for (int comboIdx = 0; comboIdx < pairCombos.Length; comboIdx++)
-            {
-                int[] sides = pairCombos[comboIdx];
-                var list0 = candidatesBySide[sides[0]];
-                var list1 = candidatesBySide[sides[1]];
-                if (list0.Count == 0 || list1.Count == 0) continue;
-
-                for (int i0 = 0; i0 < list0.Count; i0++)
+                if (list0.Count > 0 && list1.Count > 0 && list2.Count > 0 && list3.Count > 0)
                 {
-                    float t0 = list0[i0].TravelTime;
-                    int idx1 = FindClosestIndex(list1, t0);
-                    for (int d1 = -1; d1 <= 1; d1++)
+                    for (int i0 = 0; i0 < list0.Count; i0++)
                     {
-                        int k1 = idx1 + d1;
-                        if (k1 < 0 || k1 >= list1.Count) continue;
-                        float t1 = list1[k1].TravelTime;
-                        float delta = Mathf.Abs(t0 - t1);
-                        if (delta < bestDelta)
+                        var c0 = list0[i0];
+                        float t0 = c0.TravelTime;
+                        int idx1 = FindClosestIndex(list1, t0);
+                        int idx2 = FindClosestIndex(list2, t0);
+                        int idx3 = FindClosestIndex(list3, t0);
+
+                        int k1Min = idx1;
+                        while (k1Min > 0 && t0 - list1[k1Min - 1].TravelTime <= 0.65f) k1Min--;
+                        k1Min = Mathf.Min(k1Min, Mathf.Max(0, idx1 - 6));
+                        int k1Max = idx1;
+                        while (k1Max < list1.Count - 1 && list1[k1Max + 1].TravelTime - t0 <= 0.65f) k1Max++;
+                        k1Max = Mathf.Max(k1Max, Mathf.Min(list1.Count - 1, idx1 + 6));
+
+                        int k2Min = idx2;
+                        while (k2Min > 0 && t0 - list2[k2Min - 1].TravelTime <= 0.65f) k2Min--;
+                        k2Min = Mathf.Min(k2Min, Mathf.Max(0, idx2 - 6));
+                        int k2Max = idx2;
+                        while (k2Max < list2.Count - 1 && list2[k2Max + 1].TravelTime - t0 <= 0.65f) k2Max++;
+                        k2Max = Mathf.Max(k2Max, Mathf.Min(list2.Count - 1, idx2 + 6));
+
+                        int k3Min = idx3;
+                        while (k3Min > 0 && t0 - list3[k3Min - 1].TravelTime <= 0.65f) k3Min--;
+                        k3Min = Mathf.Min(k3Min, Mathf.Max(0, idx3 - 6));
+                        int k3Max = idx3;
+                        while (k3Max < list3.Count - 1 && list3[k3Max + 1].TravelTime - t0 <= 0.65f) k3Max++;
+                        k3Max = Mathf.Max(k3Max, Mathf.Min(list3.Count - 1, idx3 + 6));
+
+                        for (int k1 = k1Min; k1 <= k1Max; k1++)
                         {
-                            bestDelta = delta;
-                            bestTeamCandidates = new EntranceCandidate[] { list0[i0], list1[k1] };
+                            var c1 = list1[k1];
+                            float t1 = c1.TravelTime;
+                            if (Mathf.Abs(t0 - t1) >= bestDelta) continue;
+
+                            for (int k2 = k2Min; k2 <= k2Max; k2++)
+                            {
+                                var c2 = list2[k2];
+                                float t2 = c2.TravelTime;
+                                if (Mathf.Abs(t0 - t2) >= bestDelta) continue;
+
+                                for (int k3 = k3Min; k3 <= k3Max; k3++)
+                                {
+                                    var c3 = list3[k3];
+                                    float t3 = c3.TravelTime;
+
+                                    float minT = Mathf.Min(t0, Mathf.Min(t1, Mathf.Min(t2, t3)));
+                                    float maxT = Mathf.Max(t0, Mathf.Max(t1, Mathf.Max(t2, t3)));
+                                    float delta = maxT - minT;
+
+                                    if (delta >= bestDelta) continue;
+
+                                    var cands = new EntranceCandidate[] { c0, c1, c2, c3 };
+                                    if (tier == 2 || AreCandidatesSafelySeparated(cands, curMinSpawn, curMinDoor, curMinInterior))
+                                    {
+                                        bestDelta = delta;
+                                        bestTeamCandidates = cands;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            else // teamCount == 2
+            {
+                int[][] pairCombos = new int[][]
+                {
+                    new int[] { 0, 1 }, new int[] { 0, 2 }, new int[] { 0, 3 },
+                    new int[] { 1, 2 }, new int[] { 1, 3 }, new int[] { 2, 3 }
+                };
+
+                for (int comboIdx = 0; comboIdx < pairCombos.Length; comboIdx++)
+                {
+                    int[] sides = pairCombos[comboIdx];
+                    var list0 = candidatesBySide[sides[0]];
+                    var list1 = candidatesBySide[sides[1]];
+                    if (list0.Count == 0 || list1.Count == 0) continue;
+
+                    for (int i0 = 0; i0 < list0.Count; i0++)
+                    {
+                        var c0 = list0[i0];
+                        float t0 = c0.TravelTime;
+                        int idx1 = FindClosestIndex(list1, t0);
+
+                        int k1Min = idx1;
+                        while (k1Min > 0 && t0 - list1[k1Min - 1].TravelTime <= 0.65f) k1Min--;
+                        k1Min = Mathf.Min(k1Min, Mathf.Max(0, idx1 - 10));
+
+                        int k1Max = idx1;
+                        while (k1Max < list1.Count - 1 && list1[k1Max + 1].TravelTime - t0 <= 0.65f) k1Max++;
+                        k1Max = Mathf.Max(k1Max, Mathf.Min(list1.Count - 1, idx1 + 10));
+
+                        for (int k1 = k1Min; k1 <= k1Max; k1++)
+                        {
+                            var c1 = list1[k1];
+                            float t1 = c1.TravelTime;
+                            float delta = Mathf.Abs(t0 - t1);
+                            if (delta >= bestDelta) continue;
+
+                            var cands = new EntranceCandidate[] { c0, c1 };
+                            if (tier == 2 || AreCandidatesSafelySeparated(cands, curMinSpawn, curMinDoor, curMinInterior))
+                            {
+                                bestDelta = delta;
+                                bestTeamCandidates = cands;
+                            }
                         }
                     }
                 }
@@ -1775,6 +1960,13 @@ public class FactoryMapGenerator : NetworkBehaviour
                         2 => GridToWorld(edgeCoord + halfHwOffset, -courtyardDist),
                         _ => GridToWorld(-courtyardDist, edgeCoord + halfHwOffset)
                     };
+                    Vector2 interiorPos = s switch
+                    {
+                        0 => GridToWorld(edgeCoord + halfHwOffset, hitCoord),
+                        1 => GridToWorld(hitCoord, edgeCoord + halfHwOffset),
+                        2 => GridToWorld(edgeCoord + halfHwOffset, hitCoord),
+                        _ => GridToWorld(hitCoord, edgeCoord + halfHwOffset)
+                    };
                     final4Entrances[s] = new EntranceCandidate
                     {
                         WallSide = s,
@@ -1785,7 +1977,8 @@ public class FactoryMapGenerator : NetworkBehaviour
                         TotalDist = courtyardDist + Mathf.Max(4, hw + 2) + 100f,
                         TravelTime = (courtyardDist + Mathf.Max(4, hw + 2) + 100f) / playerSprintSpeed,
                         WorldDoorPos = doorPos,
-                        WorldSpawnPos = spawnPos
+                        WorldSpawnPos = spawnPos,
+                        WorldInteriorPos = interiorPos
                     };
                 }
             }
@@ -1849,6 +2042,29 @@ public class FactoryMapGenerator : NetworkBehaviour
         MaxTeamTravelTimeDelta = maxObservedTime - minObservedTime;
         AllTeamsDistinctCardinalsVerified = (usedSides.Count == bestTeamCandidates.Length);
         AllTeamsEquidistantVerified = (MaxTeamTravelTimeDelta <= 0.6f);
+
+        float minObservedSpawnDist = float.MaxValue;
+        float minObservedDoorDist = float.MaxValue;
+        float minObservedInteriorDist = float.MaxValue;
+
+        for (int i = 0; i < bestTeamCandidates.Length; i++)
+        {
+            for (int j = i + 1; j < bestTeamCandidates.Length; j++)
+            {
+                float sd = Vector2.Distance(bestTeamCandidates[i].WorldSpawnPos, bestTeamCandidates[j].WorldSpawnPos);
+                float dd = Vector2.Distance(bestTeamCandidates[i].WorldDoorPos, bestTeamCandidates[j].WorldDoorPos);
+                float id = Vector2.Distance(bestTeamCandidates[i].WorldInteriorPos, bestTeamCandidates[j].WorldInteriorPos);
+                if (sd < minObservedSpawnDist) minObservedSpawnDist = sd;
+                if (dd < minObservedDoorDist) minObservedDoorDist = dd;
+                if (id < minObservedInteriorDist) minObservedInteriorDist = id;
+            }
+        }
+
+        MinObservedTeamSpawnDistanceWorld = minObservedSpawnDist;
+        MinObservedTeamDoorDistanceWorld = minObservedDoorDist;
+        MinObservedTeamInteriorDistanceWorld = minObservedInteriorDist;
+        AllTeamSpawnsSeparatedVerified = (bestTeamCandidates.Length <= 1) ||
+            (minObservedSpawnDist >= minSpawnSep && minObservedDoorDist >= minDoorSep && minObservedInteriorDist >= minInteriorSep);
     }
 
     private float[] ComputeMultiFloorDijkstraFromObjective()
@@ -2140,8 +2356,9 @@ public class FactoryMapGenerator : NetworkBehaviour
 
         int crossY = (_height - hw) / 2;
 
-        int flankYMin = margin;
-        int flankYMax = _height - margin;
+        int stairYMargin = Mathf.Max(8, (_config != null ? _config.EntranceCornerMargin : 14));
+        int flankYMin = Mathf.Clamp(Mathf.Min(margin, stairYMargin - 2), 2, _height - 2);
+        int flankYMax = Mathf.Clamp(Mathf.Max(_height - margin, _height - stairYMargin + 2), 2, _height - 2);
 
         // 1. Carve West & East flanking hallways connecting stairwells
         for (int y = flankYMin; y < flankYMax; y++)
@@ -4387,12 +4604,16 @@ public class FactoryMapGenerator : NetworkBehaviour
 
         // Safety Pass: Ensure every HallwayFloor passage across the floor is at least >= 1.5x the player's body wide
         EnforceMinimumHallwayWidthOnGrid();
+
+        // Ensure stairwell bay walls and landing throats remain 100% locked
+        CarveAndReserveStairwellBaysForFloor(floorLevel);
     }
 
     private bool CanWidenHallwayIntoWall(int wx, int wy)
     {
         if (wx <= 1 || wx >= _width - 2 || wy <= 1 || wy >= _height - 2) return false;
         if (_grid[wx, wy] != CellType.Wall) return false;
+        if (_entranceProtectedZone != null && _entranceProtectedZone[wx, wy]) return false;
 
         // 1. Never convert a wall tile adjacent to any doorway within 2 tiles (preserves jambs!)
         for (int dx = -2; dx <= 2; dx++)
@@ -4455,6 +4676,7 @@ public class FactoryMapGenerator : NetworkBehaviour
     {
         if (x <= 1 || x >= _width - 2 || y <= 1 || y >= _height - 2) return false;
         if (_grid[x, y] != CellType.HallwayFloor) return false;
+        if (_entranceProtectedZone != null && _entranceProtectedZone[x, y]) return false;
 
         // Never revert actual exterior entrances on floor 0
         if (_currentFloor != null && _currentFloor.FloorLevel == 0 && _entrances != null)
@@ -5168,7 +5390,10 @@ public class FactoryMapGenerator : NetworkBehaviour
 
                 if (col.gameObject.name == "CoverPillar")
                 {
-                    Destroy(col.gameObject);
+                    if (Application.isPlaying)
+                        Destroy(col.gameObject);
+                    else
+                        DestroyImmediate(col.gameObject);
                     continue;
                 }
 
@@ -5230,7 +5455,10 @@ public class FactoryMapGenerator : NetworkBehaviour
                 if (hit.gameObject.name == "CoverPillar")
                 {
                     hit.gameObject.SetActive(false);
-                    Destroy(hit.gameObject);
+                    if (Application.isPlaying)
+                        Destroy(hit.gameObject);
+                    else
+                        DestroyImmediate(hit.gameObject);
                 }
             }
         }

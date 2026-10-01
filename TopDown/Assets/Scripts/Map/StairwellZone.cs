@@ -7,11 +7,10 @@ using UnityEngine.Rendering.Universal;
 /// and an <see cref="UpperFloorLevel"/> (at its top landing).
 /// <para>
 /// - Entering from the <b>Bottom Landing</b> (on the lower floor) or <b>Top Landing</b> (on the upper floor)
-///   puts the player <b>on top of the stairs</b> (<see cref="IsLocalPlayerClimbing"/> = true), smoothly
+///   puts the player on top of the stairs (<see cref="IsLocalPlayerClimbing"/> = true), smoothly
 ///   cross-fading floors from 0% to 100% as the player walks along the steps.
-/// - Walking across the <b>further/elevated half</b> of the staircase while on the lower floor without
-///   entering from the bottom landing lets the player walk <b>underneath</b> the elevated upper flight of
-///   stairs (rendered above the player at sortingOrder 25) without switching or teleporting floors.
+/// - The sides of the staircase that the player is not allowed to enter are enclosed by solid walls
+///   on the respective floors, so only the valid entrance landing is accessible.
 /// </para>
 /// </summary>
 [RequireComponent(typeof(BoxCollider2D))]
@@ -27,11 +26,6 @@ public class StairwellZone : MonoBehaviour
     private Light2D _stairLight;
 
     private bool _isLocalPlayerClimbing;
-
-    private readonly List<SpriteRenderer> _elevatedUpperRenderers = new List<SpriteRenderer>();
-    private readonly List<Collider2D> _upperHandrailColliders = new List<Collider2D>();
-    private BoxCollider2D _underStairLowBulkheadCollider;
-    private SpriteRenderer _underStairShadowRenderer;
 
     private static Sprite _cachedWhiteSprite;
 
@@ -72,8 +66,8 @@ public class StairwellZone : MonoBehaviour
     // ──────────────────────────── Initialization ───────────────────────────
 
     /// <summary>
-    /// Builds the physical 4x10 staircase flight: bottom landing, 12 steps (lower ground-supported half +
-    /// elevated upper half you can walk underneath on the lower floor), handrails, and trigger volume.
+    /// Builds the physical 4x10 staircase flight: bottom landing, 12 steps, continuous solid handrails,
+    /// and continuous climb trigger volume.
     /// </summary>
     public void Initialize(
         FactoryMapGenerator mapGenerator,
@@ -86,8 +80,6 @@ public class StairwellZone : MonoBehaviour
         _lowerFloorLevel = lowerFloorLevel;
         _upperFloorLevel = upperFloorLevel;
         _isLocalPlayerClimbing = false;
-        _elevatedUpperRenderers.Clear();
-        _upperHandrailColliders.Clear();
 
         EnsureSprite();
 
@@ -103,38 +95,26 @@ public class StairwellZone : MonoBehaviour
         trigger.isTrigger = true;
         trigger.size = new Vector2(3.8f, 8.8f);
 
-        // 1. Lower half base housing (ground-supported portion on lower floor, y = -4.8 .. 0.0)
-        var lowerBaseGo = new GameObject("StairwellBase_Lower");
-        lowerBaseGo.transform.SetParent(transform, false);
-        lowerBaseGo.transform.localPosition = new Vector3(0f, -2.4f, 0f);
-        lowerBaseGo.transform.localScale = new Vector3(3.8f, 4.8f, 1f);
-        var lowerBaseSr = lowerBaseGo.AddComponent<SpriteRenderer>();
-        lowerBaseSr.sprite = _cachedWhiteSprite;
-        lowerBaseSr.color = new Color(0.20f, 0.22f, 0.24f, 1f);
-        lowerBaseSr.sortingOrder = -3;
+        // 1. Solid base housing underneath the full stair flight (y = -4.8 .. +4.8)
+        var baseGo = new GameObject("StairwellBase");
+        baseGo.transform.SetParent(transform, false);
+        baseGo.transform.localPosition = Vector3.zero;
+        baseGo.transform.localScale = new Vector3(3.8f, 9.6f, 1f);
+        var baseSr = baseGo.AddComponent<SpriteRenderer>();
+        baseSr.sprite = _cachedWhiteSprite;
+        baseSr.color = new Color(0.20f, 0.22f, 0.24f, 1f);
+        baseSr.sortingOrder = -3;
 
-        // 2. Under-stair ground shadow under the elevated upper half (y = 0.0 .. +4.8) so walking underneath feels physical
-        var shadowGo = new GameObject("UnderStairShadow");
-        shadowGo.transform.SetParent(transform, false);
-        shadowGo.transform.localPosition = new Vector3(0f, 2.4f, 0f);
-        shadowGo.transform.localScale = new Vector3(3.8f, 4.8f, 1f);
-        _underStairShadowRenderer = shadowGo.AddComponent<SpriteRenderer>();
-        _underStairShadowRenderer.sprite = _cachedWhiteSprite;
-        _underStairShadowRenderer.color = new Color(0.05f, 0.06f, 0.07f, 0.55f);
-        _underStairShadowRenderer.sortingOrder = -3;
+        // 2. Bottom & Top Landing platforms
+        CreateLandingPlatform("BottomLandingPad", new Vector2(0f, -3.8f), new Color(0.24f, 0.28f, 0.25f, 1f));
+        CreateLandingPlatform("TopLandingPad", new Vector2(0f, 3.8f), new Color(0.28f, 0.26f, 0.23f, 1f));
 
-        // 3. Bottom & Top Landing platforms
-        CreateLandingPlatform("BottomLandingPad", new Vector2(0f, -3.8f), new Color(0.24f, 0.28f, 0.25f, 1f), isElevatedUpper: false);
-        CreateLandingPlatform("TopLandingPad", new Vector2(0f, 3.8f), new Color(0.28f, 0.26f, 0.23f, 1f), isElevatedUpper: true);
-
-        // 4. 12 physical concrete step treads from y = -2.65 to y = +2.65
-        //    Steps 0..5 (lower half) sit on the ground; Steps 6..11 (further/upper half) are elevated overhead!
+        // 3. 12 physical concrete step treads from y = -2.65 to y = +2.65
         const int stepCount = 12;
         for (int s = 0; s < stepCount; s++)
         {
             float t = s / (float)(stepCount - 1);
             float localY = Mathf.Lerp(-2.65f, 2.65f, t);
-            bool isElevatedUpperStep = s >= 6;
 
             var stepGo = new GameObject($"StairStep_{s + 1}");
             stepGo.transform.SetParent(transform, false);
@@ -146,32 +126,13 @@ public class StairwellZone : MonoBehaviour
             float shade = Mathf.Lerp(0.26f, 0.52f, t);
             stepSr.color = new Color(shade, shade + 0.01f, shade + 0.02f, 1f);
             stepSr.sortingOrder = -2;
-
-            if (isElevatedUpperStep)
-            {
-                _elevatedUpperRenderers.Add(stepSr);
-            }
         }
 
-        // 5. Split Handrails into Lower Ground Handrails (always solid at the base of the stairs)
-        //    and Upper Elevated Handrails (only solid while the player is climbing ON TOP of the stairs,
-        //    so players on the lower floor can walk freely UNDERNEATH the elevated upper half!).
-        CreateHandrail("Handrail_LowerLeft", new Vector2(-1.82f, -1.45f), new Vector2(0.26f, 2.5f), isElevatedUpper: false);
-        CreateHandrail("Handrail_LowerRight", new Vector2(1.82f, -1.45f), new Vector2(0.26f, 2.5f), isElevatedUpper: false);
+        // 4. Continuous solid handrails on both sides of the staircase
+        CreateHandrail("Handrail_Left", new Vector2(-1.82f, 0f), new Vector2(0.26f, 5.6f));
+        CreateHandrail("Handrail_Right", new Vector2(1.82f, 0f), new Vector2(0.26f, 5.6f));
 
-        CreateHandrail("Handrail_UpperLeft", new Vector2(-1.82f, 1.45f), new Vector2(0.26f, 2.8f), isElevatedUpper: true);
-        CreateHandrail("Handrail_UpperRight", new Vector2(1.82f, 1.45f), new Vector2(0.26f, 2.8f), isElevatedUpper: true);
-
-        // 5b. Low-clearance under-stair bulkhead divider at y = -0.10 (active ONLY when walking underneath on the lower floor,
-        //     blocking a player underneath the upper half from walking south through the solid underside of the low steps)
-        var bulkheadGo = new GameObject("UnderStairLowBulkhead");
-        bulkheadGo.transform.SetParent(transform, false);
-        bulkheadGo.transform.localPosition = new Vector3(0f, -0.10f, 0f);
-        _underStairLowBulkheadCollider = bulkheadGo.AddComponent<BoxCollider2D>();
-        _underStairLowBulkheadCollider.isTrigger = false;
-        _underStairLowBulkheadCollider.size = new Vector2(3.4f, 0.24f);
-
-        // 6. Overhead stairwell light beacon
+        // 5. Overhead stairwell light beacon
         var lightGo = new GameObject("StairwellBeaconLight");
         lightGo.transform.SetParent(transform, false);
         lightGo.transform.localPosition = Vector3.zero;
@@ -181,11 +142,9 @@ public class StairwellZone : MonoBehaviour
         _stairLight.intensity = 0.85f;
         _stairLight.pointLightOuterRadius = 7.5f;
         _stairLight.pointLightInnerRadius = 1.0f;
-
-        ApplyElevationVisualAndColliderMode();
     }
 
-    private void CreateLandingPlatform(string name, Vector2 localPos, Color color, bool isElevatedUpper)
+    private void CreateLandingPlatform(string name, Vector2 localPos, Color color)
     {
         var go = new GameObject(name);
         go.transform.SetParent(transform, false);
@@ -196,14 +155,9 @@ public class StairwellZone : MonoBehaviour
         sr.sprite = _cachedWhiteSprite;
         sr.color = color;
         sr.sortingOrder = -2;
-
-        if (isElevatedUpper)
-        {
-            _elevatedUpperRenderers.Add(sr);
-        }
     }
 
-    private void CreateHandrail(string name, Vector2 localPos, Vector2 size, bool isElevatedUpper)
+    private void CreateHandrail(string name, Vector2 localPos, Vector2 size)
     {
         var railGo = new GameObject(name);
         railGo.transform.SetParent(transform, false);
@@ -218,59 +172,6 @@ public class StairwellZone : MonoBehaviour
         var box = railGo.AddComponent<BoxCollider2D>();
         box.isTrigger = false;
         box.size = Vector2.one;
-
-        if (isElevatedUpper)
-        {
-            _elevatedUpperRenderers.Add(sr);
-            _upperHandrailColliders.Add(box);
-        }
-    }
-
-    /// <summary>
-    /// Updates the sorting order and collider state of the elevated upper half of the staircase:
-    /// - When the local player is on <see cref="LowerFloorLevel"/> and NOT climbing on top of the stairs,
-    ///   the further/upper half of the staircase is elevated overhead (<c>sortingOrder = 25</c>, above the player)
-    ///   and its upper handrail colliders are disabled so the player can walk <b>underneath</b> the stairs!
-    /// - When the local player IS climbing on top of the stairs (or is on <see cref="UpperFloorLevel"/>),
-    ///   the steps render beneath the player (<c>sortingOrder = -2</c>) and the upper handrails guide the player.
-    /// </summary>
-    private void ApplyElevationVisualAndColliderMode()
-    {
-        int curFloor = _mapGenerator != null ? _mapGenerator.CurrentLocalFloorLevel : 0;
-        bool walkUnderneathMode = (curFloor == _lowerFloorLevel) && !_isLocalPlayerClimbing;
-
-        if (_underStairLowBulkheadCollider != null)
-        {
-            _underStairLowBulkheadCollider.enabled = walkUnderneathMode;
-        }
-
-        for (int i = 0; i < _upperHandrailColliders.Count; i++)
-        {
-            if (_upperHandrailColliders[i] != null)
-            {
-                _upperHandrailColliders[i].enabled = !walkUnderneathMode;
-            }
-        }
-
-        for (int i = 0; i < _elevatedUpperRenderers.Count; i++)
-        {
-            SpriteRenderer sr = _elevatedUpperRenderers[i];
-            if (sr == null) continue;
-
-            Color c = sr.color;
-            if (walkUnderneathMode)
-            {
-                // Render elevated upper half ABOVE player body (sortingOrder 10) and weapon (12)
-                sr.sortingOrder = 25;
-                c.a = 0.84f; // Slight translucency so player can see their silhouette passing underneath
-            }
-            else
-            {
-                sr.sortingOrder = sr.gameObject.name.StartsWith("Handrail") ? 9 : -2;
-                c.a = 1.0f;
-            }
-            sr.color = c;
-        }
     }
 
     // ──────────────────────────── Continuous Climb Tracking ────────────────
@@ -300,17 +201,12 @@ public class StairwellZone : MonoBehaviour
         var player = other.GetComponent<PlayerController>();
         if (player == null || !player.HasInputAuthority) return;
 
-        if (!_isLocalPlayerClimbing)
-        {
-            ApplyElevationVisualAndColliderMode();
-            return;
-        }
+        if (!_isLocalPlayerClimbing) return;
 
         _isLocalPlayerClimbing = false;
         float t = ComputeClimbProgress(player.transform.position.y);
         int finalFloor = t >= 0.5f ? _upperFloorLevel : _lowerFloorLevel;
         _mapGenerator.CommitToSingleFloor(finalFloor);
-        ApplyElevationVisualAndColliderMode();
     }
 
     private void HandlePlayerInStairwellVolume(Collider2D other)
@@ -328,22 +224,18 @@ public class StairwellZone : MonoBehaviour
 
         if (!_isLocalPlayerClimbing)
         {
-            // Player can ONLY begin climbing ON TOP of the stairs by entering through:
+            // Player can ONLY begin climbing by entering through:
             // - the Bottom Landing (t <= 0.28) when on LowerFloorLevel, OR
             // - the Top Landing (t >= 0.72) when on UpperFloorLevel!
-            // Walking across the further/elevated half (t > 0.28) while on LowerFloorLevel walks UNDERNEATH the stairs!
             bool enteredBottomMouthFromLower = (curFloor == _lowerFloorLevel && t <= 0.28f && localX <= 1.65f);
             bool enteredTopMouthFromUpper = (curFloor == _upperFloorLevel && t >= 0.72f && localX <= 1.65f);
 
             if (enteredBottomMouthFromLower || enteredTopMouthFromUpper)
             {
                 _isLocalPlayerClimbing = true;
-                ApplyElevationVisualAndColliderMode();
             }
             else
             {
-                // Walking underneath the elevated upper half on LowerFloorLevel — do NOT switch floors!
-                ApplyElevationVisualAndColliderMode();
                 return;
             }
         }
@@ -366,11 +258,6 @@ public class StairwellZone : MonoBehaviour
         if (gameObject.activeSelf != visible)
         {
             gameObject.SetActive(visible);
-        }
-
-        if (visible)
-        {
-            ApplyElevationVisualAndColliderMode();
         }
     }
 

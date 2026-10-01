@@ -40,6 +40,13 @@ public class PlayerController : NetworkBehaviour
         NetworkVariableReadPermission.Everyone,
         NetworkVariableWritePermission.Owner);
 
+    private readonly NetworkVariable<int> _netFloorLevel = new NetworkVariable<int>(
+        0,
+        NetworkVariableReadPermission.Everyone,
+        NetworkVariableWritePermission.Owner);
+
+    private int _localFloorLevel;
+
     // ────────────────────────────── Events ─────────────────────────────────
 
     /// <summary>Fired whenever health changes. Passes current health.</summary>
@@ -52,6 +59,33 @@ public class PlayerController : NetworkBehaviour
 
     /// <summary>True if this client has authority to control this player (Owner when networked, or local when offline).</summary>
     public bool HasInputAuthority => !IsSpawned || IsOwner;
+
+    /// <summary>Floor level the player is currently on (-1=Basement, 0=1st Floor, 1=2nd Floor, 2=3rd Floor).</summary>
+    public int CurrentFloorLevel
+    {
+        get
+        {
+            if (HasInputAuthority)
+            {
+                if (FactoryMapGenerator.Instance != null)
+                {
+                    return FactoryMapGenerator.Instance.CurrentLocalFloorLevel;
+                }
+                return _localFloorLevel;
+            }
+            return IsSpawned ? _netFloorLevel.Value : _localFloorLevel;
+        }
+    }
+
+    /// <summary>Explicitly updates the floor level for this player.</summary>
+    public void SetFloorLevel(int floorLevel)
+    {
+        _localFloorLevel = floorLevel;
+        if (IsSpawned && IsOwner)
+        {
+            _netFloorLevel.Value = floorLevel;
+        }
+    }
 
     /// <summary>The Health component attached to this player.</summary>
     public Health PlayerHealth => _health;
@@ -204,6 +238,16 @@ public class PlayerController : NetworkBehaviour
         if (HasInputAuthority)
         {
             HandleAimRotation();
+
+            if (FactoryMapGenerator.Instance != null)
+            {
+                int localFloor = FactoryMapGenerator.Instance.CurrentLocalFloorLevel;
+                _localFloorLevel = localFloor;
+                if (IsSpawned && IsOwner && _netFloorLevel.Value != localFloor)
+                {
+                    _netFloorLevel.Value = localFloor;
+                }
+            }
         }
         else
         {

@@ -65,10 +65,16 @@ public class ComputerTerminalObjective : NetworkBehaviour
         NetworkVariableReadPermission.Everyone,
         NetworkVariableWritePermission.Server);
 
+    private readonly NetworkVariable<int> _netFloorLevel = new NetworkVariable<int>(
+        0,
+        NetworkVariableReadPermission.Everyone,
+        NetworkVariableWritePermission.Server);
+
     // Offline fallbacks
     private float _localProgress;
     private bool _localIsBeingHacked;
     private bool _localIsDownloaded;
+    private int _localFloorLevel;
 
     // ────────────────────────────── Events ─────────────────────────────────
 
@@ -94,6 +100,44 @@ public class ComputerTerminalObjective : NetworkBehaviour
 
     /// <summary>Maximum interaction distance in world units.</summary>
     public float InteractionRadius => _config != null ? _config.InteractionRadius : 2.2f;
+
+    /// <summary>Floor level where this terminal is located (-1=Basement, 0=1st Floor, 1=2nd Floor, 2=3rd Floor).</summary>
+    public int FloorLevel
+    {
+        get
+        {
+            if (IsSpawned) return _netFloorLevel.Value;
+            if (FactoryMapGenerator.Instance != null) return FactoryMapGenerator.Instance.ObjectiveFloorLevel;
+            return _localFloorLevel;
+        }
+    }
+
+    /// <summary>Sets the authoritative floor level for this terminal.</summary>
+    public void SetFloorLevelServer(int floorLevel)
+    {
+        _localFloorLevel = floorLevel;
+        if (IsSpawned && IsServer)
+        {
+            _netFloorLevel.Value = floorLevel;
+        }
+    }
+
+    /// <summary>
+    /// Returns true if <paramref name="player"/> is on the exact same floor as this terminal
+    /// and not in the middle of a staircase transition.
+    /// </summary>
+    public bool IsPlayerOnTerminalFloor(PlayerController player)
+    {
+        if (player == null) return false;
+
+        if (player.HasInputAuthority && FactoryMapGenerator.Instance != null)
+        {
+            if (FactoryMapGenerator.Instance.CurrentStairClimbProgress >= 0f) return false;
+            return FactoryMapGenerator.Instance.CurrentLocalFloorLevel == FloorLevel;
+        }
+
+        return player.CurrentFloorLevel == FloorLevel;
+    }
 
     // ────────────────────────────── Runtime State ──────────────────────────
 
@@ -220,6 +264,8 @@ public class ComputerTerminalObjective : NetworkBehaviour
 
     private void UpdateRangeCheck()
     {
+        FindLocalPlayerIfNeeded();
+
         if (_localPlayer == null || _localPlayer.IsDead)
         {
             _isLocalPlayerInRange = false;
@@ -230,12 +276,23 @@ public class ComputerTerminalObjective : NetworkBehaviour
             return;
         }
 
+        bool isCorrectFloor = IsPlayerOnTerminalFloor(_localPlayer);
         float dist = Vector2.Distance(_localPlayer.transform.position, transform.position);
-        _isLocalPlayerInRange = dist <= InteractionRadius;
+        _isLocalPlayerInRange = isCorrectFloor && (dist <= InteractionRadius);
 
-        if (_isLocalPlayerHacking && (!_isLocalPlayerInRange || IsDownloaded))
+        if (_isLocalPlayerHacking && (!_isLocalPlayerInRange || !isCorrectFloor || IsDownloaded))
         {
             StopLocalHacking();
+        }
+
+        // Only display the world-space progress bar above the terminal if on the correct floor
+        if (_worldProgressRoot != null)
+        {
+            bool showWorldBar = isCorrectFloor && !IsDownloaded;
+            if (_worldProgressRoot.gameObject.activeSelf != showWorldBar)
+            {
+                _worldProgressRoot.gameObject.SetActive(showWorldBar);
+            }
         }
     }
 
@@ -243,9 +300,11 @@ public class ComputerTerminalObjective : NetworkBehaviour
     {
         if (IsDownloaded) return;
 
-        // If not currently hacking and in range, start hacking!
+        // If not currently hacking and in range on the correct floor, start hacking!
         if (!_isLocalPlayerHacking && _isLocalPlayerInRange && _localPlayer != null && !_localPlayer.IsDead)
         {
+            if (!IsPlayerOnTerminalFloor(_localPlayer)) return;
+
             // Only allow one player to hack at a time
             if (IsBeingHacked && IsSpawned && _netHackerClientId.Value != NetworkManager.Singleton.LocalClientId)
             {
@@ -376,6 +435,17 @@ public class ComputerTerminalObjective : NetworkBehaviour
     {
         if (keystrokeCount <= 0 || IsDownloaded) return;
 
+        FindLocalPlayerIfNeeded();
+        PlayerController targetPlayer = hackerCarrier != null
+            ? hackerCarrier.GetComponent<PlayerController>()
+            : _localPlayer;
+
+        if (targetPlayer == null || !IsPlayerOnTerminalFloor(targetPlayer))
+        {
+            StopLocalHacking();
+            return;
+        }
+
         float perKey = _config != null ? _config.ProgressPerKeystroke : 0.016f;
         float delta = keystrokeCount * perKey;
 
@@ -400,8 +470,17 @@ public class ComputerTerminalObjective : NetworkBehaviour
     [Rpc(SendTo.Server)]
     private void SetHackingStateServerRpc(bool isHacking, ulong clientId)
     {
-        if (isHacking && !_netIsDownloaded.Value)
+        if (isHacking)
         {
+            if (_netIsDownloaded.Value) return;
+
+            PlayerController player = FindPlayerForClient(clientId);
+            if (player == null || player.IsDead) return;
+
+            // Authoritative server-side validation: must be on correct floor and within interaction range
+            if (!IsPlayerOnTerminalFloor(player)) return;
+            if (Vector2.Distance(player.transform.position, transform.position) > InteractionRadius + 1.5f) return;
+
             _netIsBeingHacked.Value = true;
             _netHackerClientId.Value = clientId;
         }
@@ -417,12 +496,40 @@ public class ComputerTerminalObjective : NetworkBehaviour
     {
         if (_netIsDownloaded.Value || delta <= 0f) return;
 
-        ObjectiveCarrier carrier = FindCarrierForClient(hackerClientId);
+        PlayerController player = FindPlayerForClient(hackerClientId);
+        if (player == null || player.IsDead) return;
+
+        // Authoritative server-side validation: must be on correct floor and within interaction range
+        if (!IsPlayerOnTerminalFloor(player))
+        {
+            if (_netHackerClientId.Value == hackerClientId)
+            {
+                _netIsBeingHacked.Value = false;
+                _netHackerClientId.Value = ulong.MaxValue;
+            }
+            return;
+        }
+
+        if (Vector2.Distance(player.transform.position, transform.position) > InteractionRadius + 1.5f)
+        {
+            return;
+        }
+
+        ObjectiveCarrier carrier = player.GetComponent<ObjectiveCarrier>();
         AdvanceProgressAuthoritative(delta, carrier);
     }
 
     private void AdvanceProgressAuthoritative(float delta, ObjectiveCarrier carrier)
     {
+        if (carrier != null)
+        {
+            var pc = carrier.GetComponent<PlayerController>();
+            if (pc != null && !IsPlayerOnTerminalFloor(pc))
+            {
+                return;
+            }
+        }
+
         float newProgress = Mathf.Clamp01(Progress + delta);
         SetProgressServer(newProgress);
 
@@ -470,24 +577,36 @@ public class ComputerTerminalObjective : NetworkBehaviour
         OnDownloadCompleted?.Invoke(carrier);
     }
 
-    private ObjectiveCarrier FindCarrierForClient(ulong clientId)
+    private PlayerController FindPlayerForClient(ulong clientId)
     {
         if (NetworkManager.Singleton != null &&
             NetworkManager.Singleton.ConnectedClients.TryGetValue(clientId, out var client) &&
             client.PlayerObject != null)
         {
-            var carrier = client.PlayerObject.GetComponent<ObjectiveCarrier>();
-            if (carrier != null) return carrier;
+            var pc = client.PlayerObject.GetComponent<PlayerController>();
+            if (pc != null) return pc;
         }
 
         // Fallback: check scene PlayerController owned by clientId
-        var carriers = FindObjectsByType<ObjectiveCarrier>(FindObjectsSortMode.None);
-        for (int i = 0; i < carriers.Length; i++)
+        var players = FindObjectsByType<PlayerController>(FindObjectsSortMode.None);
+        for (int i = 0; i < players.Length; i++)
         {
-            if (carriers[i] != null && carriers[i].OwnerClientId == clientId)
+            if (players[i] != null && (!IsSpawned || players[i].OwnerClientId == clientId))
             {
-                return carriers[i];
+                return players[i];
             }
+        }
+
+        return _localPlayer;
+    }
+
+    private ObjectiveCarrier FindCarrierForClient(ulong clientId)
+    {
+        var player = FindPlayerForClient(clientId);
+        if (player != null)
+        {
+            var carrier = player.GetComponent<ObjectiveCarrier>();
+            if (carrier != null) return carrier;
         }
 
         return _localCarrier;

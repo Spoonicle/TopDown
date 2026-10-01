@@ -4973,6 +4973,12 @@ public class FactoryMapGenerator : NetworkBehaviour
         {
             _terminalObject.transform.position = new Vector3(objCenter.x, objCenter.y, 0f);
 
+            var termComp = _terminalObject.GetComponent<ComputerTerminalObjective>();
+            if (termComp != null)
+            {
+                termComp.SetFloorLevelServer(_objectiveFloorLevel);
+            }
+
             _terminalLight = _terminalObject.GetComponent<Light2D>();
             if (_terminalLight == null) _terminalLight = _terminalObject.AddComponent<Light2D>();
             _terminalLight.lightType = Light2D.LightType.Point;

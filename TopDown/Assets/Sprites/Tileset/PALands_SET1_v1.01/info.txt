@@ -1,0 +1,17 @@
+animated objects sprite sheet block size:
+
+16x16 tileset
+
+bonfire - 32x48
+trash_can_fire - 16x48
+tree1 - 160x256
+tree2 - 160x208
+tree3 - 160x192
+
+32x32 tileset
+
+bonfire - 64x96
+trash_can_fire - 32x96
+tree1 - 320x512
+tree2 - 320x416
+tree3 - 320x384

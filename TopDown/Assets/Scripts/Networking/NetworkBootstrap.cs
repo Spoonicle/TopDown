@@ -77,10 +77,26 @@ public class NetworkBootstrap : MonoBehaviour
 
         if (_clientPlayerPrefab == null) return;
 
-        Vector3 spawnPos = new Vector3(
-            _clientSpawnOrigin.x + (clientId * 1.5f),
-            _clientSpawnOrigin.y,
-            0f);
+        int teamIndex = (_availableTeams != null && _availableTeams.Length > 0)
+            ? (int)(clientId % (ulong)_availableTeams.Length)
+            : 0;
+
+        Vector3 spawnPos;
+        if (FactoryMapGenerator.Instance != null)
+        {
+            Vector2 teamSpawn = teamIndex == 0 ? FactoryMapGenerator.Instance.TeamASpawnPosition :
+                                teamIndex == 1 ? FactoryMapGenerator.Instance.TeamBSpawnPosition :
+                                teamIndex == 2 ? FactoryMapGenerator.Instance.TeamCSpawnPosition :
+                                FactoryMapGenerator.Instance.TeamASpawnPosition;
+            spawnPos = new Vector3(teamSpawn.x + ((clientId % 4) * 0.8f), teamSpawn.y, 0f);
+        }
+        else
+        {
+            spawnPos = new Vector3(
+                _clientSpawnOrigin.x + (clientId * 1.5f),
+                _clientSpawnOrigin.y,
+                0f);
+        }
 
         NetworkObject playerInstance = Instantiate(_clientPlayerPrefab, spawnPos, Quaternion.identity);
 
@@ -88,7 +104,6 @@ public class NetworkBootstrap : MonoBehaviour
         var teamMember = playerInstance.GetComponent<TeamMember>();
         if (teamMember != null && _availableTeams != null && _availableTeams.Length > 0)
         {
-            int teamIndex = (int)(clientId % (ulong)_availableTeams.Length);
             teamMember.SetTeam(_availableTeams[teamIndex], true);
         }
 

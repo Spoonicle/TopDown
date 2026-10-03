@@ -156,6 +156,7 @@ MonoBehaviour:
   _availableTeams:
   - {fileID: 11400000, guid: 3015a683073dd6d44bcd3329845e1d51, type: 2}
   - {fileID: 11400000, guid: 0103ef1809991124d99eafce67961c21, type: 2}
+  - {fileID: 11400000, guid: 1b0451390e7675d419c6e2bbd98a2e4d, type: 2}
   _clientSpawnOrigin: {x: 2.5, y: -2.5}
 --- !u!114 &84550111
 MonoBehaviour:

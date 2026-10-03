@@ -248,6 +248,9 @@ public class FactoryMapGenerator : NetworkBehaviour
     /// <summary>Read-only list of all generated rooms across all floors.</summary>
     public IReadOnlyList<RoomData> AllRooms => _allRooms;
 
+    /// <summary>Active factory map generation configuration asset.</summary>
+    public FactoryMapConfig Config => _config;
+
     /// <summary>Number of physics-pushed swinging doors spawned in the current layout.</summary>
     public int SpawnedDoorCount => _spawnedDoors.Count;
 
@@ -3518,7 +3521,8 @@ public class FactoryMapGenerator : NetworkBehaviour
         var winGo = new GameObject($"BreakableWindow_{winIdx}");
         winGo.transform.SetParent(_currentFloor.FloorRoot.transform, false);
         var window = winGo.AddComponent<BreakableWindow>();
-        window.Initialize(winIdx, this, worldCenter, windowSize, chosen.horizontal);
+        Color wallCol = _config != null ? _config.WallColor : new Color(0.36f, 0.37f, 0.38f, 1f);
+        window.Initialize(winIdx, this, worldCenter, windowSize, chosen.horizontal, wallCol);
         _spawnedWindows.Add(window);
 
         return true;

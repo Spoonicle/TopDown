@@ -13,6 +13,8 @@ public class BreakableWindow : MonoBehaviour
     private FactoryMapGenerator _mapGenerator;
     private BoxCollider2D _movementBlockerCollider;
     private SpriteRenderer _glassRenderer;
+    private SpriteRenderer _sillRenderer;
+    private Color _wallColor = new Color(0.36f, 0.37f, 0.38f, 1f);
     private bool _isBroken;
 
     private static Sprite _cachedWhiteSprite;
@@ -25,6 +27,15 @@ public class BreakableWindow : MonoBehaviour
     /// <summary>True once the glass pane has been shattered by gunfire.</summary>
     public bool IsBroken => _isBroken;
 
+    /// <summary>Gets the sprite renderer for the window sill / wall piece that remains after shattering.</summary>
+    public SpriteRenderer SillRenderer => _sillRenderer;
+
+    /// <summary>Gets the sprite renderer for the glass pane.</summary>
+    public SpriteRenderer GlassRenderer => _glassRenderer;
+
+    /// <summary>Gets the wall color assigned to the leftover window sill piece.</summary>
+    public Color WallColor => _wallColor;
+
     // ──────────────────────────── Initialization ───────────────────────────
 
     /// <summary>
@@ -35,11 +46,16 @@ public class BreakableWindow : MonoBehaviour
         FactoryMapGenerator mapGenerator,
         Vector2 worldCenter,
         Vector2 size,
-        bool horizontal)
+        bool horizontal,
+        Color? wallColor = null)
     {
         _windowIndex = windowIndex;
         _mapGenerator = mapGenerator;
         _isBroken = false;
+
+        _wallColor = wallColor ?? (mapGenerator != null && mapGenerator.Config != null
+            ? mapGenerator.Config.WallColor
+            : new Color(0.36f, 0.37f, 0.38f, 1f));
 
         EnsureSprite();
 
@@ -51,7 +67,7 @@ public class BreakableWindow : MonoBehaviour
         _movementBlockerCollider.isTrigger = false;
         _movementBlockerCollider.size = size;
 
-        // 1. Dark metallic window sill / mullion frame
+        // 1. Window sill / remaining wall piece matching wall color
         var sillGo = new GameObject("WindowSill");
         sillGo.transform.SetParent(transform, false);
         sillGo.transform.localPosition = Vector3.zero;
@@ -59,10 +75,10 @@ public class BreakableWindow : MonoBehaviour
             ? new Vector3(size.x, 0.42f, 1f)
             : new Vector3(0.42f, size.y, 1f);
 
-        var sillSr = sillGo.AddComponent<SpriteRenderer>();
-        sillSr.sprite = _cachedWhiteSprite;
-        sillSr.color = new Color(0.20f, 0.22f, 0.24f, 1f);
-        sillSr.sortingOrder = 7;
+        _sillRenderer = sillGo.AddComponent<SpriteRenderer>();
+        _sillRenderer.sprite = _cachedWhiteSprite;
+        _sillRenderer.color = _wallColor;
+        _sillRenderer.sortingOrder = 7;
 
         // 2. Translucent pale-cyan industrial glass pane
         var glassGo = new GameObject("GlassPane");
@@ -104,6 +120,11 @@ public class BreakableWindow : MonoBehaviour
         if (_glassRenderer != null)
         {
             _glassRenderer.enabled = false;
+        }
+
+        if (_sillRenderer != null)
+        {
+            _sillRenderer.color = _wallColor;
         }
 
         SpawnGlassShardBurst(hitPoint);

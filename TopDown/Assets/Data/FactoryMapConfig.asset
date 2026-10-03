@@ -12,8 +12,13 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 5af96784ff78a1b42bc242bdf24bd701, type: 3}
   m_Name: FactoryMapConfig
   m_EditorClassIdentifier: Assembly-CSharp::FactoryMapConfig
+  _useRandomAspectRatio: 1
   _buildingWidth: 108
   _buildingHeight: 108
+  _buildingWidthMin: 80
+  _buildingWidthMax: 140
+  _buildingHeightMin: 70
+  _buildingHeightMax: 130
   _courtyardMargin: 14
   _entranceCornerMargin: 18
   _objectiveRoomSize: 24
@@ -34,3 +39,17 @@ MonoBehaviour:
   _coverColor: {r: 0.28, g: 0.29, b: 0.31, a: 1}
   _doorColor: {r: 0.45, g: 0.38, b: 0.32, a: 1}
   _hallwayLightColor: {r: 0.88, g: 0.74, b: 0.42, a: 1}
+  _floorTiles:
+  - {fileID: 11400000, guid: bcac8d8fa77d4da458a66841d86a3c8f, type: 2}
+  - {fileID: 11400000, guid: 5696b19a6a5ee4d498d4b7e44ed28c30, type: 2}
+  - {fileID: 11400000, guid: b50e65e77eded6f499ef078c77c376e5, type: 2}
+  - {fileID: 11400000, guid: 3f8439b7943fd4d4c92b5dd6f9e9642b, type: 2}
+  - {fileID: 11400000, guid: ef1833c3bffd16141a36a7036a3f4ed2, type: 2}
+  - {fileID: 11400000, guid: 2d4d6e27a377c094a9db80c85f55ed0b, type: 2}
+  - {fileID: 11400000, guid: f42d631ce65303943889bdaf5dd5c076, type: 2}
+  - {fileID: 11400000, guid: 681af7425c522fb499472949cea3baca, type: 2}
+  - {fileID: 11400000, guid: 8ca387c7d0ca3ab4b90418eab02d81f4, type: 2}
+  - {fileID: 11400000, guid: 9a35fa017d8a5454794390df7e3d5fd6, type: 2}
+  - {fileID: 11400000, guid: 79a1c880bab04844384d428cff15dcb3, type: 2}
+  - {fileID: 11400000, guid: 507ab2fdb5a803b44ae096527af624c0, type: 2}
+  - {fileID: 11400000, guid: 6fe8b31e9809cfc4284a306256f40c22, type: 2}

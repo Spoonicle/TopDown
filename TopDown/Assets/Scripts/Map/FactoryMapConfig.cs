@@ -128,7 +128,16 @@ public class FactoryMapConfig : ScriptableObject
     [Tooltip("Warm yellow/amber color for hallway emergency lights (#c4a35a).")]
     [SerializeField] private Color _hallwayLightColor = new Color(0.88f, 0.74f, 0.42f, 1f);
 
+    // ───────────────────────────── Floor Tilemapping ────────────────────────
+
+    [Header("Floor Tilemapping")]
+    [Tooltip("Floor tiles randomly selected to tile the rooms and hallways.")]
+    [SerializeField] private UnityEngine.Tilemaps.TileBase[] _floorTiles;
+
     // ───────────────────────────── Public Accessors ─────────────────────────
+
+    /// <summary>Floor tiles randomly selected to tile the rooms and hallways.</summary>
+    public UnityEngine.Tilemaps.TileBase[] FloorTiles => _floorTiles;
 
     /// <summary>If true, building dimensions are rolled per seed within the min/max ranges.</summary>
     public bool UseRandomAspectRatio => _useRandomAspectRatio;

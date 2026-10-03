@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using Unity.Netcode;
 using UnityEngine;
 using UnityEngine.Rendering.Universal;
+using UnityEngine.Tilemaps;
 
 /// <summary>
 /// Server-authoritative procedural cement factory generator.
@@ -126,6 +127,7 @@ public class FactoryMapGenerator : NetworkBehaviour
         public readonly List<DesignatedDoorway> DesignatedDoorways = new List<DesignatedDoorway>();
 
         public readonly List<(SpriteRenderer renderer, Color baseColor)> Renderers = new List<(SpriteRenderer, Color)>();
+        public readonly List<Tilemap> Tilemaps = new List<Tilemap>();
         public readonly List<HallwayLight> Lights = new List<HallwayLight>();
         public readonly List<Collider2D> Colliders = new List<Collider2D>();
     }
@@ -631,6 +633,14 @@ public class FactoryMapGenerator : NetworkBehaviour
                 }
             }
 
+            for (int i = 0; i < state.Tilemaps.Count; i++)
+            {
+                if (state.Tilemaps[i] != null)
+                {
+                    state.Tilemaps[i].color = new Color(1f, 1f, 1f, alpha);
+                }
+            }
+
             for (int i = 0; i < state.Lights.Count; i++)
             {
                 if (state.Lights[i] != null)
@@ -1118,6 +1128,9 @@ public class FactoryMapGenerator : NetworkBehaviour
         // 8.5. Normalize all Doorway runs (lock flanking Wall jambs) & spawn full-span SwingDoors filling 100% of every doorway
         NormalizeAndSpawnAllDoorsForFloor(floorLevel);
 
+        // 9. Build the tiled floor using the 13 tile floor palette!
+        BuildFloorTilemap(state, rng);
+
         // 10. Instantiate greedy-merged concrete wall colliders and cover pillars for this floor
         BuildWallAndCoverGeometry();
 
@@ -1150,11 +1163,119 @@ public class FactoryMapGenerator : NetworkBehaviour
             state.Renderers.Add((srs[i], srs[i].color));
         }
 
+        state.Tilemaps.Clear();
+        state.Tilemaps.AddRange(state.FloorRoot.GetComponentsInChildren<Tilemap>(true));
+
         state.Lights.Clear();
         state.Lights.AddRange(state.FloorRoot.GetComponentsInChildren<HallwayLight>(true));
 
         state.Colliders.Clear();
         state.Colliders.AddRange(state.FloorRoot.GetComponentsInChildren<Collider2D>(true));
+    }
+
+    private void BuildFloorTilemap(FloorGenerationState state, System.Random rng)
+    {
+        TileBase[] floorTiles = _config != null ? _config.FloorTiles : null;
+        if (floorTiles == null || floorTiles.Length == 0)
+        {
+            var fallbackList = new List<TileBase>();
+            string[] names = {
+                "32x32_tile_floor_1", "32x32_tile_floor_2", "32x32_tile_floor_3", "32x32_tile_floor_4",
+                "32x32_worn_tile_floor_1", "32x32_worn_tile_floor_2", "32x32_worn_tile_floor_3", "32x32_worn_tile_floor_4",
+                "32x32_veryWorn_tile_floor_1", "32x32_veryWorn_tile_floor_2", "32x32_veryWorn_tile_floor_3", "32x32_veryWorn_tile_floor_4",
+                "32x32_4tiled_floor"
+            };
+#if UNITY_EDITOR
+            for (int i = 0; i < names.Length; i++)
+            {
+                var t = UnityEditor.AssetDatabase.LoadAssetAtPath<TileBase>($"Assets/Data/Tiles/{names[i]}.asset");
+                if (t != null) fallbackList.Add(t);
+            }
+#endif
+            if (fallbackList.Count > 0)
+            {
+                floorTiles = fallbackList.ToArray();
+            }
+        }
+        if (floorTiles == null || floorTiles.Length == 0) return;
+
+        var gridGo = new GameObject($"FloorTilemapGrid_{state.FloorLevel}");
+        gridGo.transform.SetParent(state.FloorRoot.transform, false);
+        gridGo.transform.position = new Vector3(-_width * 0.5f, -_height * 0.5f, 0f);
+        var grid = gridGo.AddComponent<Grid>();
+        grid.cellSize = new Vector3(1f, 1f, 0f);
+
+        var tilemapGo = new GameObject("FloorTilemap");
+        tilemapGo.transform.SetParent(gridGo.transform, false);
+        tilemapGo.transform.localPosition = Vector3.zero;
+        var tilemap = tilemapGo.AddComponent<Tilemap>();
+        var tr = tilemapGo.AddComponent<TilemapRenderer>();
+        tr.sortingOrder = 0;
+
+        bool[,] isFloor = new bool[_width, _height];
+
+        // 1. Mark all room footprints
+        for (int ri = 0; ri < state.Rooms.Count; ri++)
+        {
+            RectInt b = state.Rooms[ri].Bounds;
+            for (int rx = b.xMin; rx < b.xMax; rx++)
+            {
+                for (int ry = b.yMin; ry < b.yMax; ry++)
+                {
+                    if (rx >= 0 && rx < _width && ry >= 0 && ry < _height)
+                    {
+                        isFloor[rx, ry] = true;
+                    }
+                }
+            }
+        }
+
+        // 2. Mark all hallways, doorways, cover pillars, and windows
+        for (int x = 0; x < _width; x++)
+        {
+            for (int y = 0; y < _height; y++)
+            {
+                CellType ct = state.Grid[x, y];
+                if (ct == CellType.HallwayFloor ||
+                    ct == CellType.RoomFloor ||
+                    ct == CellType.ObjectiveRoomFloor ||
+                    ct == CellType.Doorway ||
+                    ct == CellType.CoverPillar ||
+                    ct == CellType.Window)
+                {
+                    isFloor[x, y] = true;
+                }
+            }
+        }
+
+        // 3. Batch set tiles
+        int totalFloorCount = 0;
+        for (int x = 0; x < _width; x++)
+        {
+            for (int y = 0; y < _height; y++)
+            {
+                if (isFloor[x, y]) totalFloorCount++;
+            }
+        }
+
+        var positions = new Vector3Int[totalFloorCount];
+        var tilesToSet = new TileBase[totalFloorCount];
+        int idx = 0;
+
+        for (int y = 0; y < _height; y++)
+        {
+            for (int x = 0; x < _width; x++)
+            {
+                if (!isFloor[x, y]) continue;
+
+                positions[idx] = new Vector3Int(x, y, 0);
+                tilesToSet[idx] = floorTiles[rng.Next(floorTiles.Length)];
+                idx++;
+            }
+        }
+
+        tilemap.SetTiles(positions, tilesToSet);
+        state.Tilemaps.Add(tilemap);
     }
 
     private void CreateNonGroundFloorBackdrop(int floorLevel, Transform parent)
